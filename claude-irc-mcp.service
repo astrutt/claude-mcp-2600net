@@ -1,0 +1,27 @@
+[Unit]
+Description=2600net IRC MCP Server
+Documentation=https://github.com/astrutt/claude-irc-bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=claudebot
+Group=claudebot
+ExecStart=/opt/claude-irc-bot/venv/bin/python3 /opt/claude-irc-bot/irc_mcp_server.py
+WorkingDirectory=/opt/claude-irc-bot
+Restart=on-failure
+RestartSec=15s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-irc-mcp
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target
