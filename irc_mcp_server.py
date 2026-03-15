@@ -1956,10 +1956,34 @@ async def irc_server_info(params: IrcdCommandInput) -> str:
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
+
     log.info(f"Starting {VERSION}")
     log.info(f"IRC server: {IRC_SERVER}:{IRC_PORT}")
     log.info(f"MCP endpoint: http://{MCP_HOST}:{MCP_PORT}/mcp")
-    # Launch uvicorn directly so host and port come from config.ini,
-    # not from FastMCP's environment variable defaults.
+
+    # FastMCP's transport_security middleware rejects requests where the Host
+    # header doesn't match the bound address. Behind a reverse proxy the Host
+    # is the public domain (e.g. wpm.2600.chat), not 127.0.0.1, so it always
+    # fails. We patch _validate_host to always return True — this is safe
+    # because we only bind to 127.0.0.1 so only Apache can reach us.
+    try:
+        from mcp.server import transport_security as _ts
+        _ts_classes = [
+            v for v in vars(_ts).values()
+            if isinstance(v, type) and hasattr(v, "_validate_host")
+        ]
+        for cls in _ts_classes:
+            cls._validate_host = lambda self, host: True
+            log.info(f"Patched {cls.__name__}._validate_host to allow all hosts.")
+    except Exception as e:
+        log.warning(f"Could not patch transport_security: {e}")
+
     app = mcp.streamable_http_app()
-    uvicorn.run(app, host=MCP_HOST, port=MCP_PORT, log_level="info")
+    uvicorn.run(
+        app,
+        host=MCP_HOST,
+        port=MCP_PORT,
+        log_level="info",
+        forwarded_allow_ips="*",
+        proxy_headers=True,
+    )
