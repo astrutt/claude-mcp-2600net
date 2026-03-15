@@ -1955,7 +1955,11 @@ async def irc_server_info(params: IrcdCommandInput) -> str:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    import uvicorn
     log.info(f"Starting {VERSION}")
     log.info(f"IRC server: {IRC_SERVER}:{IRC_PORT}")
     log.info(f"MCP endpoint: http://{MCP_HOST}:{MCP_PORT}/mcp")
-    mcp.run(transport="streamable-http", host=MCP_HOST, port=MCP_PORT)
+    # Launch uvicorn directly so host and port come from config.ini,
+    # not from FastMCP's environment variable defaults.
+    app = mcp.streamable_http_app()
+    uvicorn.run(app, host=MCP_HOST, port=MCP_PORT, log_level="info")

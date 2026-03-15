@@ -1,15 +1,15 @@
 [Unit]
 Description=2600net IRC MCP Server
-Documentation=https://github.com/astrutt/claude-irc-bot
+Documentation=https://github.com/astrutt/claude-irc-mcp
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=claudebot
-Group=claudebot
-ExecStart=/opt/claude-irc-bot/venv/bin/python3 /opt/claude-irc-bot/irc_mcp_server.py
-WorkingDirectory=/opt/claude-irc-bot
+User=claudemcp
+Group=claudemcp
+ExecStart=/opt/claude-irc-mcp/venv/bin/python3 /opt/claude-irc-mcp/irc_mcp_server.py
+WorkingDirectory=/opt/claude-irc-mcp
 Restart=on-failure
 RestartSec=15s
 StartLimitIntervalSec=300
