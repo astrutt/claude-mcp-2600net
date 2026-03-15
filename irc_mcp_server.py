@@ -86,6 +86,17 @@ NS_EMAIL     = _cfg.get("irc", "ns_email", fallback="irc-mcp@2600.chat")
 MCP_HOST     = _cfg.get("mcp", "host",    fallback="127.0.0.1")
 MCP_PORT     = _cfg.getint("mcp", "port", fallback=8765)
 
+# ── Limits (all configurable in mcp_server.ini [limits] section) ──────────────
+_lim = _cfg["limits"] if "limits" in _cfg else {}
+# Global hard cap on total concurrent IRC sessions
+LIMIT_SESSIONS_GLOBAL    = int(_lim.get("max_sessions_global",     500))
+# Max concurrent sessions per desired_name (pre-OAuth proxy for per-user)
+LIMIT_SESSIONS_PER_USER  = int(_lim.get("max_sessions_per_user",   2))
+# Max irc_connect NEW session attempts per desired_name per hour
+LIMIT_CONNECT_PER_HOUR   = int(_lim.get("connect_rate_per_hour",   10))
+# Max irc_connect NEW session attempts per desired_name per minute
+LIMIT_CONNECT_PER_MINUTE = int(_lim.get("connect_rate_per_minute", 5))
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _irc_lower(s: str) -> str:
     return s.lower().translate(str.maketrans("[]\\", "{}|"))
@@ -809,6 +820,62 @@ class IRCSession:
         return self._identified_event.wait(timeout=timeout)
 
 
+# ── Connect rate limiter ──────────────────────────────────────────────────────
+class ConnectRateLimiter:
+    """
+    Per-name rate limiter for new session creation via irc_connect.
+    Tracks attempts per minute and per hour per desired_name.
+    Resuming an existing session_id bypasses this — it's free.
+    """
+
+    def __init__(self):
+        # name_key → deque of attempt timestamps (monotonic)
+        self._minute_attempts: dict[str, deque] = defaultdict(deque)
+        self._hour_attempts:   dict[str, deque] = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def check(self, name_key: str) -> tuple[bool, str]:
+        """
+        Returns (allowed, reason).
+        Prunes stale timestamps on each check.
+        """
+        now = time.monotonic()
+        minute_ago = now - 60
+        hour_ago   = now - 3600
+
+        with self._lock:
+            # Prune old entries
+            mq = self._minute_attempts[name_key]
+            hq = self._hour_attempts[name_key]
+            while mq and mq[0] < minute_ago:
+                mq.popleft()
+            while hq and hq[0] < hour_ago:
+                hq.popleft()
+
+            if len(mq) >= LIMIT_CONNECT_PER_MINUTE:
+                wait = int(60 - (now - mq[0]))
+                return False, (
+                    f"Too many connection attempts. "
+                    f"Please wait {wait}s before creating a new session."
+                )
+            if len(hq) >= LIMIT_CONNECT_PER_HOUR:
+                wait = int(3600 - (now - hq[0]))
+                return False, (
+                    f"Hourly connection limit reached. "
+                    f"Please wait {wait}s before creating a new session."
+                )
+
+            # Record attempt
+            mq.append(now)
+            hq.append(now)
+            return True, ""
+
+    def reset(self, name_key: str) -> None:
+        with self._lock:
+            self._minute_attempts.pop(name_key, None)
+            self._hour_attempts.pop(name_key, None)
+
+
 # ── Session Pool ──────────────────────────────────────────────────────────────
 class SessionPool:
     """Manages all active IRC sessions and persists them across restarts."""
@@ -816,9 +883,16 @@ class SessionPool:
     def __init__(self):
         self._sessions: dict[str, IRCSession] = {}
         self._meta: dict[str, dict]           = _load_sessions()
-        self._lock = threading.Lock()
+        self._lock  = threading.Lock()
+        self._rl    = ConnectRateLimiter()
         # Start idle cleanup loop
         threading.Thread(target=self._cleanup_loop, daemon=True).start()
+        log.info(
+            f"Session limits — global: {LIMIT_SESSIONS_GLOBAL}, "
+            f"per-user: {LIMIT_SESSIONS_PER_USER}, "
+            f"connect rate: {LIMIT_CONNECT_PER_MINUTE}/min "
+            f"{LIMIT_CONNECT_PER_HOUR}/hr"
+        )
 
     def _cleanup_loop(self) -> None:
         while True:
@@ -852,8 +926,45 @@ class SessionPool:
                     self._meta[sid]["last_active"] = time.time()
         _save_sessions(self._meta)
 
+    def check_limits(self, desired_name: str) -> tuple[bool, str]:
+        """
+        Check all limits before allowing a new session to be created.
+        Returns (allowed, reason_if_denied).
+        """
+        name_key = _irc_lower(desired_name)
+
+        # 1. Global session cap
+        with self._lock:
+            total = len(self._sessions)
+        if total >= LIMIT_SESSIONS_GLOBAL:
+            return False, (
+                f"Server is at capacity ({LIMIT_SESSIONS_GLOBAL} concurrent sessions). "
+                "Please try again later."
+            )
+
+        # 2. Per-user session cap — count active sessions for this name
+        nick = _make_nick(desired_name)
+        with self._lock:
+            user_count = sum(
+                1 for meta in self._meta.values()
+                if _irc_lower(meta.get("nick", "")) == _irc_lower(nick)
+                or _irc_lower(meta.get("nick", "")).startswith(_irc_lower(nick))
+            )
+        if user_count >= LIMIT_SESSIONS_PER_USER:
+            return False, (
+                f"Maximum of {LIMIT_SESSIONS_PER_USER} sessions allowed per user. "
+                "Resume an existing session_id or disconnect one first."
+            )
+
+        # 3. Connect rate limit
+        allowed, reason = self._rl.check(name_key)
+        if not allowed:
+            return False, reason
+
+        return True, ""
+
     def create(self, desired_name: str, ns_email: str = "") -> tuple[str, IRCSession]:
-        """Create a brand-new session with a fresh session_id."""
+        """Create a brand-new session — limits must be checked before calling this."""
         session_id = secrets.token_hex(16)
         nick       = _make_nick(desired_name)
         ns_pass    = secrets.token_urlsafe(24)
@@ -1098,7 +1209,14 @@ async def irc_connect(params: ConnectInput) -> str:
                 }, indent=2)
             # session_id not found — fall through to create new
 
-        # Create new session, passing user's email for NickServ registration
+        # Create new session — check limits first
+        allowed, reason = _pool.check_limits(params.desired_name)
+        if not allowed:
+            return json.dumps({
+                "error":  "rate_limited",
+                "reason": reason,
+            })
+
         ns_email = params.email or ""
         session_id, sess = await asyncio.to_thread(
             _pool.create, params.desired_name, ns_email
