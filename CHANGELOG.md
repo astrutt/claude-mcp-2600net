@@ -5,6 +5,45 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [2.2.0] — 2026-03-16
+
+### Added
+
+**Rate limiting and session caps**
+- `ConnectRateLimiter` class — per-name sliding window rate limiter
+  - 5 new session attempts per minute per desired_name (configurable)
+  - 10 new session attempts per hour per desired_name (configurable)
+  - Resuming an existing `session_id` is always free — never rate limited
+- Global concurrent session cap (default: 500, configurable)
+- Per-user session cap (default: 2, mirrors Anope 1-email-2-nicks rule)
+- All limits configurable in `mcp_server.ini` under `[limits]` section
+- `SessionPool.check_limits()` — checks all three limits before creating a session
+- Limits logged at startup: `Session limits — global: 500, per-user: 2, connect rate: 5/min 10/hr`
+
+**Security checks at startup**
+- `_check_runtime_security()` called in lifespan before server accepts connections
+- `_warn_permissions()` helper — checks file permissions on any sensitive path
+- Hard failures (`sys.exit(1)`) for: missing key file, corrupt key file, `cryptography` not installed
+- Warnings (non-fatal) for: running as root, key/config/sessions file permissions too open
+- `_save_sessions()` refuses to write plaintext if encryption is unavailable — skips save, logs error
+
+### Changed
+
+- Version bumped to v2.2
+- CTCP VERSION response updated to `v2.2` with full author credit
+- `_save_sessions()` checks sessions file permissions after every write
+- `_get_or_create_session_key()` — corrupt key file now calls `sys.exit(1)` instead of returning `None`
+- Log format: seconds only (`datefmt="%Y-%m-%d %H:%M:%S"`) — no milliseconds
+
+### Fixed
+
+- `ProtectSystem=full` in systemd service was blocking key file creation at runtime.
+  Fixed by generating the key in `install_mcp.sh` (running as root) — service only reads,
+  never writes to `/etc/`
+- `/etc/claude-irc-mcp/` directory not group-writable during install — fixed in `install_mcp.sh`
+
+---
+
 ## [2.1.0] — 2026-03-15
 
 ### Added

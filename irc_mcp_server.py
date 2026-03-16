@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                    2600net IRC MCP Server  v1.0                             ║
+║                    2600net IRC MCP Server  v2.2                             ║
 ║                                                                              ║
 ║  An MCP server exposing 2600net IRC to any Claude.ai user.                  ║
 ║  Each user gets a persistent, NickServ-registered IRC nick.                 ║
@@ -60,7 +60,7 @@ logging.basicConfig(
 log = logging.getLogger("irc_mcp")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-VERSION          = "2600net IRC MCP Server v2.1 | Claude (Anthropic) & Andrew Strutt (r0d3nt) | github.com/astrutt/claude-mcp-2600net"
+VERSION          = "2600net IRC MCP Server v2.2 | Claude (Anthropic) & Andrew Strutt (r0d3nt) | github.com/astrutt/claude-mcp-2600net"
 CONFIG_PATH      = "/etc/claude-irc-mcp/mcp_server.ini"
 SESSIONS_PATH    = "/var/lib/claude-irc-mcp/mcp_sessions.json"
 SESSION_KEY_FILE = "/etc/claude-irc-mcp/session.key"  # Fernet key for session encryption
@@ -757,7 +757,7 @@ class IRCSession:
         log.info(f"[{self.session_id[:8]}] CTCP {command} from {sender}")
 
         if command == "VERSION":
-            self._send_raw(f"NOTICE {sender} :\x01VERSION 2600net IRC MCP Connector v1.0 | Claude AI\x01")
+            self._send_raw(f"NOTICE {sender} :\x01VERSION 2600net IRC MCP Connector v2.2 | Claude (Anthropic) & Andrew Strutt (r0d3nt)\x01")
         elif command == "PING":
             self._send_raw(f"NOTICE {sender} :\x01PING {arg}\x01")
         elif command == "TIME":
