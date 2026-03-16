@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                    2600net IRC MCP Server  v2.2                             ║
+║                    2600net IRC MCP Server  v2.3                             ║
 ║                                                                              ║
 ║  An MCP server exposing 2600net IRC to any Claude.ai user.                  ║
 ║  Each user gets a persistent, NickServ-registered IRC nick.                 ║
@@ -60,7 +60,7 @@ logging.basicConfig(
 log = logging.getLogger("irc_mcp")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-VERSION          = "2600net IRC MCP Server v2.2 | Claude (Anthropic) & Andrew Strutt (r0d3nt) | github.com/astrutt/claude-mcp-2600net"
+VERSION          = "2600net IRC MCP Server v2.3 | Claude (Anthropic) & Andrew Strutt (r0d3nt) | github.com/astrutt/claude-mcp-2600net"
 CONFIG_PATH      = "/etc/claude-irc-mcp/mcp_server.ini"
 SESSIONS_PATH    = "/var/lib/claude-irc-mcp/mcp_sessions.json"
 SESSION_KEY_FILE = "/etc/claude-irc-mcp/session.key"  # Fernet key for session encryption
@@ -373,6 +373,34 @@ class IRCSession:
         self._ircd_buf:   list[str] = []
         self._ircd_event  = threading.Event()
 
+        # Private message buffer: nick → deque of {"ts", "from", "text"}
+        self.pm_buffer: dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=MSG_BUFFER_SIZE)
+        )
+
+        # Away state
+        self.away_message: str = ""   # empty = not away
+
+        # Channel mode cache: channel_key → mode string e.g. "+nst"
+        self.channel_modes: dict[str, str] = {}
+
+        # WHO reply buffer
+        self._who_buf:   list[str] = []
+        self._who_event  = threading.Event()
+
+        # ISON reply buffer
+        self._ison_result: str = ""
+        self._ison_event   = threading.Event()
+
+        # USERHOST reply buffer
+        self._userhost_buf:   list[str] = []
+        self._userhost_event  = threading.Event()
+
+        # MONITOR/WATCH online notification buffer
+        self._monitor_online:  set[str] = set()
+        self._monitor_offline: set[str] = set()
+        self._monitor_list:    set[str] = set()
+
     # ── Connection ─────────────────────────────────────────────────────────
 
     def start(self) -> None:
@@ -494,6 +522,15 @@ class IRCSession:
                     "nick": sender,
                     "text": text,
                 })
+            else:
+                # Private message to us — buffer it
+                sender_key = _irc_lower(sender)
+                self.pm_buffer[sender_key].append({
+                    "ts":   time.strftime("%H:%M:%S", time.gmtime()),
+                    "from": sender,
+                    "text": text,
+                })
+                log.info(f"[{self.session_id[:8]}] PM from {sender}: {text[:60]}")
 
         elif cmd == "NOTICE":
             sender = _nick_from_prefix(msg["prefix"]).lower()
@@ -514,19 +551,40 @@ class IRCSession:
             elif sender == "hostserv":
                 self._handle_host_notice(text)
 
+        elif cmd == "MODE":
+            # Channel mode change — update cache
+            if p and p[0].startswith("#"):
+                ch_key = _irc_lower(p[0])
+                modes  = p[1] if len(p) > 1 else ""
+                self.channel_modes[ch_key] = modes
+
+        elif cmd == "AWAY":
+            # Server confirms AWAY set or cleared (306/305 numerics also used)
+            pass
+
         # ── Numeric replies ────────────────────────────────────────────────
 
+        elif cmd == "305":   # RPL_UNAWAY — you are no longer marked as away
+            self.away_message = ""
+            log.info(f"[{self.session_id[:8]}] Away cleared.")
+
+        elif cmd == "306":   # RPL_NOWAWAY — you are marked as away
+            log.info(f"[{self.session_id[:8]}] Away set.")
+
         # WHOIS (311-318)
-        elif cmd in ("311", "312", "319", "317"):
+        elif cmd in ("311", "312", "319", "317", "313", "330", "338", "378", "379"):
             self._pending_append("whois", " ".join(p[1:]))
 
         elif cmd == "318":   # end of WHOIS
             self._pending_append("whois", " ".join(p[1:]))
             self._pending_signal("whois")
 
-        elif cmd == "401":   # no such nick (WHOIS)
-            self._pending_append("whois", f"No such nick: {p[1] if len(p)>1 else '?'}")
+        elif cmd == "401":   # no such nick (WHOIS/WHO/etc)
+            target = p[1] if len(p) > 1 else "?"
+            self._pending_append("whois", f"No such nick: {target}")
             self._pending_signal("whois")
+            self._pending_append(f"who:{_irc_lower(target)}", f"No such nick: {target}")
+            self._pending_signal(f"who:{_irc_lower(target)}")
 
         # NAMES (353, 366)
         elif cmd == "353":
@@ -571,16 +629,60 @@ class IRCSession:
             key     = f"topic:{_irc_lower(channel)}"
             self._pending_set(key, topic)
 
+        # MODE reply (324 = RPL_CHANNELMODEIS, 329 = RPL_CREATIONTIME)
+        elif cmd == "324":
+            channel = p[1] if len(p) > 1 else ""
+            modes   = p[2] if len(p) > 2 else ""
+            ch_key  = _irc_lower(channel)
+            self.channel_modes[ch_key] = modes
+            key = f"mode:{ch_key}"
+            self._pending_set(key, modes)
+            self._pending_signal(key)
+
+        elif cmd == "221":   # RPL_UMODEIS — user mode
+            modes = p[1] if len(p) > 1 else ""
+            self._pending_set("umode", modes)
+            self._pending_signal("umode")
+
+        # WHO reply (352 = RPL_WHOREPLY, 354 = RPL_WHOSPCRPL, 315 = RPL_ENDOFWHO)
+        elif cmd in ("352", "354"):
+            self._who_buf.append(" ".join(p[1:]))
+
+        elif cmd == "315":   # end of WHO
+            self._who_event.set()
+
+        # ISON reply (303)
+        elif cmd == "303":
+            self._ison_result = p[1] if len(p) > 1 else ""
+            self._ison_event.set()
+
+        # USERHOST reply (302)
+        elif cmd == "302":
+            self._userhost_buf.append(p[1] if len(p) > 1 else "")
+            self._userhost_event.set()
+
+        # MONITOR replies (730=online, 731=offline, 732=list, 733=end)
+        elif cmd == "730":   # RPL_MONONLINE
+            nicks = (p[1] if len(p) > 1 else "").split(",")
+            for n in nicks:
+                nick_only = n.split("!")[0]
+                self._monitor_online.add(_irc_lower(nick_only))
+                self._monitor_offline.discard(_irc_lower(nick_only))
+                log.info(f"[{self.session_id[:8]}] MONITOR: {nick_only} is online")
+
+        elif cmd == "731":   # RPL_MONOFFLINE
+            nicks = (p[1] if len(p) > 1 else "").split(",")
+            for n in nicks:
+                self._monitor_offline.add(_irc_lower(n))
+                self._monitor_online.discard(_irc_lower(n))
+                log.info(f"[{self.session_id[:8]}] MONITOR: {n} is offline")
+
+        elif cmd == "732":   # RPL_MONLIST
+            for n in (p[1] if len(p) > 1 else "").split(","):
+                if n:
+                    self._monitor_list.add(_irc_lower(n))
+
         # ircd-hybrid / generic server numerics → ircd buffer
-        # STATS:  210, 211, 212, 213, 214, 219
-        # ADMIN:  256, 257, 258, 259
-        # MOTD:   372, 376
-        # TIME:   391
-        # LINKS:  364, 365
-        # MAP:    015 or RPL_MAP (server specific)
-        # TRACE:  200-209, 261, 262
-        # VERSION: 351
-        # LUSERS: 251-255, 265, 266
         elif cmd in (
             "210","211","212","213","214","215","216","217","218","219",
             "256","257","258","259",
@@ -730,6 +832,10 @@ class IRCSession:
             return result[0] if result else "(no topic)"
         return result or "(no topic)"
 
+    def cmd_set_topic(self, channel: str, topic: str) -> None:
+        self.last_active = time.monotonic()
+        self._send_raw(f"TOPIC {channel} :{topic}")
+
     def cmd_list(self) -> list[str]:
         self.last_active = time.monotonic()
         self._pending_init("list")
@@ -753,7 +859,133 @@ class IRCSession:
         self._cs_notice_event.wait(timeout=CMD_TIMEOUT)
         return list(self._cs_notice_buf)
 
-    # ── CTCP handlers ───────────────────────────────────────────────────────
+    def cmd_away(self, message: str = "") -> None:
+        """Set or clear away status. Empty message = back."""
+        self.last_active = time.monotonic()
+        if message:
+            self.away_message = message
+            self._send_raw(f"AWAY :{message}")
+        else:
+            self.away_message = ""
+            self._send_raw("AWAY")
+
+    def cmd_change_nick(self, new_nick: str) -> None:
+        self.last_active = time.monotonic()
+        self._send_raw(f"NICK {new_nick}")
+
+    def cmd_get_channel_mode(self, channel: str) -> str:
+        self.last_active = time.monotonic()
+        ch_key = _irc_lower(channel)
+        key    = f"mode:{ch_key}"
+        self._pending_init(key)
+        self._send_raw(f"MODE {channel}")
+        result = self._pending_wait(key)
+        if isinstance(result, str):
+            return result
+        return self.channel_modes.get(ch_key, "(unknown)")
+
+    def cmd_get_user_mode(self) -> str:
+        self.last_active = time.monotonic()
+        self._pending_init("umode")
+        self._send_raw(f"MODE {self.nick}")
+        result = self._pending_wait("umode")
+        return result if isinstance(result, str) else "(unknown)"
+
+    def cmd_set_mode(self, target: str, modes: str) -> None:
+        self.last_active = time.monotonic()
+        self._send_raw(f"MODE {target} {modes}")
+
+    def cmd_invite(self, nick: str, channel: str) -> None:
+        self.last_active = time.monotonic()
+        self._send_raw(f"INVITE {nick} {channel}")
+
+    def cmd_knock(self, channel: str, message: str = "") -> None:
+        self.last_active = time.monotonic()
+        if message:
+            self._send_raw(f"KNOCK {channel} :{message}")
+        else:
+            self._send_raw(f"KNOCK {channel}")
+
+    def cmd_who(self, target: str, operators_only: bool = False) -> list[str]:
+        self.last_active = time.monotonic()
+        self._who_buf.clear()
+        self._who_event.clear()
+        cmd = f"WHO {target} o" if operators_only else f"WHO {target}"
+        self._send_raw(cmd)
+        self._who_event.wait(timeout=CMD_TIMEOUT)
+        return list(self._who_buf)
+
+    def cmd_ison(self, nicks: list) -> list:
+        self.last_active = time.monotonic()
+        self._ison_result = ""
+        self._ison_event.clear()
+        self._send_raw(f"ISON {' '.join(nicks)}")
+        self._ison_event.wait(timeout=CMD_TIMEOUT)
+        return self._ison_result.split() if self._ison_result else []
+
+    def cmd_userhost(self, nicks: list) -> list:
+        self.last_active = time.monotonic()
+        self._userhost_buf.clear()
+        self._userhost_event.clear()
+        self._send_raw(f"USERHOST {' '.join(nicks[:5])}")
+        self._userhost_event.wait(timeout=CMD_TIMEOUT)
+        return list(self._userhost_buf)
+
+    def cmd_monitor_add(self, nicks: list) -> None:
+        self.last_active = time.monotonic()
+        self._monitor_list.update(_irc_lower(n) for n in nicks)
+        self._send_raw(f"MONITOR + {','.join(nicks)}")
+
+    def cmd_monitor_del(self, nicks: list) -> None:
+        self.last_active = time.monotonic()
+        for n in nicks:
+            self._monitor_list.discard(_irc_lower(n))
+        self._send_raw(f"MONITOR - {','.join(nicks)}")
+
+    def cmd_monitor_status(self) -> dict:
+        self.last_active = time.monotonic()
+        return {
+            "watching": sorted(self._monitor_list),
+            "online":   sorted(self._monitor_online),
+            "offline":  sorted(self._monitor_offline),
+        }
+
+    def cmd_setname(self, realname: str) -> None:
+        self.last_active = time.monotonic()
+        self._send_raw(f"SETNAME :{realname}")
+
+    def cmd_silence_add(self, mask: str) -> None:
+        self.last_active = time.monotonic()
+        self._send_raw(f"SILENCE +{mask}")
+
+    def cmd_silence_del(self, mask: str) -> None:
+        self.last_active = time.monotonic()
+        self._send_raw(f"SILENCE -{mask}")
+
+    def cmd_silence_list(self) -> list:
+        self.last_active = time.monotonic()
+        self._pending_init("silence")
+        self._send_raw("SILENCE")
+        result = self._pending_wait("silence")
+        return result if isinstance(result, list) else []
+
+    def cmd_send_notice(self, target: str, text: str) -> None:
+        self.last_active = time.monotonic()
+        self._send_raw(f"NOTICE {target} :{text}")
+
+    def cmd_read_pms(self, nick: str = "") -> list:
+        self.last_active = time.monotonic()
+        if nick:
+            return list(self.pm_buffer.get(_irc_lower(nick), []))
+        all_pms = []
+        for msgs in self.pm_buffer.values():
+            all_pms.extend(msgs)
+        return sorted(all_pms, key=lambda m: m["ts"])
+
+    def wait_for_identification(self, timeout: float = 30.0) -> bool:
+        return self._identified_event.wait(timeout=timeout)
+
+
 
     def _handle_ctcp_request(self, sender: str, body: str) -> None:
         """Respond to incoming CTCP requests."""
@@ -763,7 +995,7 @@ class IRCSession:
         log.info(f"[{self.session_id[:8]}] CTCP {command} from {sender}")
 
         if command == "VERSION":
-            self._send_raw(f"NOTICE {sender} :\x01VERSION 2600net IRC MCP Connector v2.2 | AI MCP Gateway | github.com/astrutt/claude-mcp-2600net\x01")
+            self._send_raw(f"NOTICE {sender} :\x01VERSION 2600net IRC MCP Connector v2.3 | AI MCP Gateway | github.com/astrutt/claude-mcp-2600net\x01")
         elif command == "PING":
             self._send_raw(f"NOTICE {sender} :\x01PING {arg}\x01")
         elif command == "TIME":
@@ -1223,6 +1455,88 @@ class IrcdCommandInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     session_id: str = Field(..., description="Your session_id.")
     command:    str = Field(..., description="Raw ircd command to send (e.g. 'ADMIN', 'MOTD', 'TIME', 'VERSION', 'LINKS', 'LUSERS').", min_length=1, max_length=100)
+
+class AwayInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    session_id: str = Field(..., description="Your session_id.")
+    message:    str = Field(default="", description="Away message. Leave blank to clear away status and mark yourself as back.", max_length=200)
+
+class ChangeNickInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    session_id: str = Field(..., description="Your session_id.")
+    new_nick:   str = Field(..., description="New nick to use. Must be a valid IRC nick.", min_length=1, max_length=15)
+
+class SetTopicInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    session_id: str = Field(..., description="Your session_id.")
+    channel:    str = Field(..., description="Channel to set topic on (e.g. '#ClaudeBot').")
+    topic:      str = Field(..., description="New topic text.", max_length=390)
+
+class GetModeInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    session_id: str = Field(..., description="Your session_id.")
+    target:     str = Field(default="", description="Channel or nick to get modes for. Leave blank for your own user modes.")
+
+class SetModeInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    session_id: str = Field(..., description="Your session_id.")
+    target:     str = Field(..., description="Channel or nick to set modes on.")
+    modes:      str = Field(..., description="Mode string e.g. '+m', '+v nick', '-o nick', '+k secretkey'.", max_length=100)
+
+class InviteInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    session_id: str = Field(..., description="Your session_id.")
+    nick:       str = Field(..., description="Nick to invite.")
+    channel:    str = Field(..., description="Channel to invite them to.")
+
+class KnockInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    session_id: str = Field(..., description="Your session_id.")
+    channel:    str = Field(..., description="Invite-only channel to knock on.")
+    message:    str = Field(default="", description="Optional message to include with the knock.", max_length=200)
+
+class WhoInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    session_id:     str  = Field(..., description="Your session_id.")
+    target:         str  = Field(..., description="Channel, nick, or hostmask to query (e.g. '#ClaudeBot', 'r0d3nt', '*.2600.chat').")
+    operators_only: bool = Field(default=False, description="If true, only return IRC operators.")
+
+class IsonInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    session_id: str       = Field(..., description="Your session_id.")
+    nicks:      list[str] = Field(..., description="List of nicks to check online status for.", min_length=1, max_length=20)
+
+class UserhostInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    session_id: str       = Field(..., description="Your session_id.")
+    nicks:      list[str] = Field(..., description="List of nicks to get userhost info for (max 5).", min_length=1, max_length=5)
+
+class MonitorInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    session_id: str       = Field(..., description="Your session_id.")
+    nicks:      list[str] = Field(..., description="List of nicks to add/remove from MONITOR list.", min_length=1, max_length=30)
+
+class SendNoticeInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    session_id: str = Field(..., description="Your session_id.")
+    target:     str = Field(..., description="Nick or channel to send NOTICE to.")
+    message:    str = Field(..., description="Notice text.", min_length=1, max_length=400)
+
+class ReadPMsInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    session_id: str = Field(..., description="Your session_id.")
+    nick:       str = Field(default="", description="Filter to PMs from a specific nick. Leave blank for all PMs.")
+    limit:      int = Field(default=20, description="Number of recent PMs to return.", ge=1, le=100)
+
+class SilenceInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    session_id: str = Field(..., description="Your session_id.")
+    mask:       str = Field(..., description="Nick or hostmask to silence (e.g. 'annoyingnick' or '*!*@spammer.host').", min_length=1, max_length=100)
+
+class SetnameInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    session_id: str = Field(..., description="Your session_id.")
+    realname:   str = Field(..., description="New realname/gecos field shown in /whois.", min_length=1, max_length=50)
 
 
 # ── FastMCP server ────────────────────────────────────────────────────────────
@@ -2245,6 +2559,466 @@ async def irc_server_info(params: IrcdCommandInput) -> str:
             "server":   IRC_SERVER,
             "response": lines,
         }, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool: irc_set_away
+# ─────────────────────────────────────────────────────────────────────────────
+@mcp.tool(name="irc_set_away", annotations={"title":"Set away status","readOnlyHint":False,"destructiveHint":False,"idempotentHint":True,"openWorldHint":True})
+async def irc_set_away(params: AwayInput) -> str:
+    """
+    Set an away message on IRC. When away, the server will tell anyone who
+    messages you or does a WHOIS that you are away.
+
+    Args:
+        params (AwayInput):
+            - session_id (str): Your session_id.
+            - message (str): Away message (e.g. 'Busy doing things for you in #pirates').
+              Leave blank to clear away status.
+
+    Returns:
+        str: Confirmation of away status.
+    """
+    try:
+        sess = _require_session(params.session_id)
+        await asyncio.to_thread(sess.cmd_away, params.message)
+        if params.message:
+            return json.dumps({"status": "away", "message": params.message})
+        return json.dumps({"status": "back", "message": "Away status cleared."})
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool: irc_change_nick
+# ─────────────────────────────────────────────────────────────────────────────
+@mcp.tool(name="irc_change_nick", annotations={"title":"Change your IRC nick","readOnlyHint":False,"destructiveHint":False,"idempotentHint":False,"openWorldHint":True})
+async def irc_change_nick(params: ChangeNickInput) -> str:
+    """
+    Change your IRC nick. The new nick must be available and not registered
+    to another user. Your session will track the new nick automatically.
+
+    Args:
+        params (ChangeNickInput):
+            - session_id (str): Your session_id.
+            - new_nick (str): Desired new nick.
+
+    Returns:
+        str: Confirmation with new nick.
+    """
+    try:
+        sess = _require_session(params.session_id)
+        old_nick = sess.nick
+        await asyncio.to_thread(sess.cmd_change_nick, params.new_nick)
+        await asyncio.sleep(1)
+        return json.dumps({"status": "nick_change_sent", "old_nick": old_nick, "requested_nick": params.new_nick, "current_nick": sess.nick})
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool: irc_set_topic
+# ─────────────────────────────────────────────────────────────────────────────
+@mcp.tool(name="irc_set_topic", annotations={"title":"Set channel topic","readOnlyHint":False,"destructiveHint":False,"idempotentHint":True,"openWorldHint":True})
+async def irc_set_topic(params: SetTopicInput) -> str:
+    """
+    Set the topic for an IRC channel. Requires operator status or ChanServ
+    TOPIC permission on protected channels.
+
+    Args:
+        params (SetTopicInput):
+            - session_id (str): Your session_id.
+            - channel (str): Channel to set topic on.
+            - topic (str): New topic text (max 390 chars).
+
+    Returns:
+        str: Confirmation.
+    """
+    try:
+        sess = _require_session(params.session_id)
+        await asyncio.to_thread(sess.cmd_set_topic, params.channel, params.topic)
+        return json.dumps({"status": "topic_set", "channel": params.channel, "topic": params.topic})
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool: irc_get_mode
+# ─────────────────────────────────────────────────────────────────────────────
+@mcp.tool(name="irc_get_mode", annotations={"title":"Get channel or user modes","readOnlyHint":True,"destructiveHint":False,"idempotentHint":True,"openWorldHint":True})
+async def irc_get_mode(params: GetModeInput) -> str:
+    """
+    Get current modes for a channel or user.
+
+    Common channel modes (ircd-hybrid):
+      +n  no external messages   +t  topic by ops only   +m  moderated
+      +i  invite only            +k  key (password)       +l  user limit
+      +s  secret (hidden in LIST)+p  private
+
+    Common user modes:
+      +i  invisible   +o  IRC operator   +x  hostname cloaking
+
+    Args:
+        params (GetModeInput):
+            - session_id (str): Your session_id.
+            - target (str): Channel (e.g. '#ClaudeBot') or nick. Blank = your own modes.
+
+    Returns:
+        str: JSON with target and current mode string.
+    """
+    try:
+        sess = _require_session(params.session_id)
+        target = params.target.strip() or sess.nick
+        if target.startswith("#"):
+            modes = await asyncio.to_thread(sess.cmd_get_channel_mode, target)
+        else:
+            modes = await asyncio.to_thread(sess.cmd_get_user_mode)
+        return json.dumps({"target": target, "modes": modes})
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool: irc_set_mode
+# ─────────────────────────────────────────────────────────────────────────────
+@mcp.tool(name="irc_set_mode", annotations={"title":"Set channel or user modes","readOnlyHint":False,"destructiveHint":False,"idempotentHint":True,"openWorldHint":True})
+async def irc_set_mode(params: SetModeInput) -> str:
+    """
+    Set modes on a channel or user. Requires appropriate permissions.
+
+    Examples:
+      +m #channel          — make channel moderated
+      -m #channel          — remove moderated
+      +v nick #channel     — give voice to a user
+      +o nick #channel     — give ops to a user
+      +k secretkey         — set channel key (password)
+      +i                   — set yourself invisible
+
+    Args:
+        params (SetModeInput):
+            - session_id (str): Your session_id.
+            - target (str): Channel or nick.
+            - modes (str): Mode string (e.g. '+m', '+v nick').
+
+    Returns:
+        str: Confirmation.
+    """
+    try:
+        sess = _require_session(params.session_id)
+        await asyncio.to_thread(sess.cmd_set_mode, params.target, params.modes)
+        return json.dumps({"status": "mode_sent", "target": params.target, "modes": params.modes})
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool: irc_invite
+# ─────────────────────────────────────────────────────────────────────────────
+@mcp.tool(name="irc_invite", annotations={"title":"Invite a user to a channel","readOnlyHint":False,"destructiveHint":False,"idempotentHint":False,"openWorldHint":True})
+async def irc_invite(params: InviteInput) -> str:
+    """
+    Invite a nick to a channel. Required for invite-only (+i) channels.
+    You typically need operator status to invite to +i channels.
+
+    Args:
+        params (InviteInput):
+            - session_id (str): Your session_id.
+            - nick (str): Nick to invite.
+            - channel (str): Channel to invite them to.
+
+    Returns:
+        str: Confirmation.
+    """
+    try:
+        sess = _require_session(params.session_id)
+        await asyncio.to_thread(sess.cmd_invite, params.nick, params.channel)
+        return json.dumps({"status": "invite_sent", "nick": params.nick, "channel": params.channel})
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool: irc_knock
+# ─────────────────────────────────────────────────────────────────────────────
+@mcp.tool(name="irc_knock", annotations={"title":"Knock on an invite-only channel","readOnlyHint":False,"destructiveHint":False,"idempotentHint":False,"openWorldHint":True})
+async def irc_knock(params: KnockInput) -> str:
+    """
+    Send a KNOCK request to an invite-only (+i) channel. Notifies channel
+    operators that you want to join. They can then invite you.
+
+    Args:
+        params (KnockInput):
+            - session_id (str): Your session_id.
+            - channel (str): Invite-only channel to knock on.
+            - message (str): Optional message for the channel operators.
+
+    Returns:
+        str: Confirmation.
+    """
+    try:
+        sess = _require_session(params.session_id)
+        await asyncio.to_thread(sess.cmd_knock, params.channel, params.message)
+        return json.dumps({"status": "knock_sent", "channel": params.channel})
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool: irc_who
+# ─────────────────────────────────────────────────────────────────────────────
+@mcp.tool(name="irc_who", annotations={"title":"WHO query — extended user information","readOnlyHint":True,"destructiveHint":False,"idempotentHint":True,"openWorldHint":True})
+async def irc_who(params: WhoInput) -> str:
+    """
+    Send a WHO query for richer user information than NAMES provides.
+    Returns username, hostname, server, realname, and idle time.
+
+    Args:
+        params (WhoInput):
+            - session_id (str): Your session_id.
+            - target (str): Channel, nick, or hostmask (e.g. '#ClaudeBot', 'r0d3nt', '*.2600.chat').
+            - operators_only (bool): If true, only return IRC operators.
+
+    Returns:
+        str: JSON with WHO reply lines.
+    """
+    try:
+        sess  = _require_session(params.session_id)
+        lines = await asyncio.to_thread(sess.cmd_who, params.target, params.operators_only)
+        return json.dumps({"target": params.target, "results": lines, "count": len(lines)}, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool: irc_ison
+# ─────────────────────────────────────────────────────────────────────────────
+@mcp.tool(name="irc_ison", annotations={"title":"Check which nicks are currently online","readOnlyHint":True,"destructiveHint":False,"idempotentHint":True,"openWorldHint":True})
+async def irc_ison(params: IsonInput) -> str:
+    """
+    Check which nicks from a list are currently connected to the IRC network.
+    Faster than doing multiple WHOIS calls.
+
+    Args:
+        params (IsonInput):
+            - session_id (str): Your session_id.
+            - nicks (list[str]): List of nicks to check (max 20).
+
+    Returns:
+        str: JSON with online and offline lists.
+    """
+    try:
+        sess   = _require_session(params.session_id)
+        online = await asyncio.to_thread(sess.cmd_ison, params.nicks)
+        offline = [n for n in params.nicks if _irc_lower(n) not in [_irc_lower(o) for o in online]]
+        return json.dumps({"online": online, "offline": offline, "checked": params.nicks}, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool: irc_userhost
+# ─────────────────────────────────────────────────────────────────────────────
+@mcp.tool(name="irc_userhost", annotations={"title":"Get userhost info for nicks","readOnlyHint":True,"destructiveHint":False,"idempotentHint":True,"openWorldHint":True})
+async def irc_userhost(params: UserhostInput) -> str:
+    """
+    Get userhost information for up to 5 nicks simultaneously.
+    Returns nick!user@host and away status.
+
+    Args:
+        params (UserhostInput):
+            - session_id (str): Your session_id.
+            - nicks (list[str]): List of nicks (max 5).
+
+    Returns:
+        str: JSON with userhost entries.
+    """
+    try:
+        sess   = _require_session(params.session_id)
+        result = await asyncio.to_thread(sess.cmd_userhost, params.nicks)
+        return json.dumps({"userhost": result}, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool: irc_monitor
+# ─────────────────────────────────────────────────────────────────────────────
+@mcp.tool(name="irc_monitor", annotations={"title":"Monitor nicks for online/offline status","readOnlyHint":False,"destructiveHint":False,"idempotentHint":True,"openWorldHint":True})
+async def irc_monitor(params: MonitorInput) -> str:
+    """
+    Add nicks to your MONITOR list. The server will notify you when they
+    come online or go offline. Use irc_monitor_status to check current state.
+
+    MONITOR is ircd-hybrid's efficient nick tracking system — more reliable
+    than polling with ISON.
+
+    Args:
+        params (MonitorInput):
+            - session_id (str): Your session_id.
+            - nicks (list[str]): Nicks to watch.
+
+    Returns:
+        str: Current monitor list status.
+    """
+    try:
+        sess = _require_session(params.session_id)
+        await asyncio.to_thread(sess.cmd_monitor_add, params.nicks)
+        await asyncio.sleep(1)
+        status = await asyncio.to_thread(sess.cmd_monitor_status)
+        return json.dumps({"status": "watching", "added": params.nicks, **status}, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool: irc_monitor_status
+# ─────────────────────────────────────────────────────────────────────────────
+@mcp.tool(name="irc_monitor_status", annotations={"title":"Check MONITOR list online/offline status","readOnlyHint":True,"destructiveHint":False,"idempotentHint":True,"openWorldHint":True})
+async def irc_monitor_status(params: SessionInput) -> str:
+    """
+    Check the current online/offline status of all nicks in your MONITOR list.
+
+    Args:
+        params (SessionInput): session_id
+
+    Returns:
+        str: JSON with watching, online, and offline lists.
+    """
+    try:
+        sess   = _require_session(params.session_id)
+        status = await asyncio.to_thread(sess.cmd_monitor_status)
+        return json.dumps(status, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool: irc_send_notice
+# ─────────────────────────────────────────────────────────────────────────────
+@mcp.tool(name="irc_send_notice", annotations={"title":"Send a NOTICE to a nick or channel","readOnlyHint":False,"destructiveHint":False,"idempotentHint":False,"openWorldHint":True})
+async def irc_send_notice(params: SendNoticeInput) -> str:
+    """
+    Send a NOTICE instead of a PRIVMSG. NOTICEs are conventionally used for
+    automated or informational messages. Most IRC clients display them
+    differently from regular messages and bots should not auto-reply to them.
+
+    Args:
+        params (SendNoticeInput):
+            - session_id (str): Your session_id.
+            - target (str): Nick or channel to send NOTICE to.
+            - message (str): Notice text.
+
+    Returns:
+        str: Confirmation.
+    """
+    try:
+        sess = _require_session(params.session_id)
+        await asyncio.to_thread(sess.cmd_send_notice, params.target, params.message)
+        return json.dumps({"status": "notice_sent", "target": params.target})
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool: irc_read_private_messages
+# ─────────────────────────────────────────────────────────────────────────────
+@mcp.tool(name="irc_read_private_messages", annotations={"title":"Read buffered private messages (PMs)","readOnlyHint":True,"destructiveHint":False,"idempotentHint":True,"openWorldHint":False})
+async def irc_read_private_messages(params: ReadPMsInput) -> str:
+    """
+    Read private messages (PMs) received this session. Messages are buffered
+    as they arrive — up to 100 per sender nick.
+
+    Args:
+        params (ReadPMsInput):
+            - session_id (str): Your session_id.
+            - nick (str): Filter to PMs from a specific nick. Leave blank for all.
+            - limit (int): Number of recent messages to return (default 20).
+
+    Returns:
+        str: JSON list of {ts, from, text} objects.
+    """
+    try:
+        sess = _require_session(params.session_id)
+        pms  = await asyncio.to_thread(sess.cmd_read_pms, params.nick)
+        pms  = pms[-params.limit:]
+        return json.dumps({"messages": pms, "count": len(pms)}, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool: irc_silence
+# ─────────────────────────────────────────────────────────────────────────────
+@mcp.tool(name="irc_silence", annotations={"title":"Manage server-side SILENCE list (ircd-hybrid)","readOnlyHint":False,"destructiveHint":False,"idempotentHint":True,"openWorldHint":True})
+async def irc_silence(params: SilenceInput) -> str:
+    """
+    Add a nick or hostmask to your server-side SILENCE list.
+    The IRC server will block messages from silenced users before they reach you —
+    more effective than client-side ignore.
+
+    Args:
+        params (SilenceInput):
+            - session_id (str): Your session_id.
+            - mask (str): Nick or hostmask to silence (e.g. 'annoyingnick' or '*!*@*.badhost.com').
+
+    Returns:
+        str: Confirmation.
+    """
+    try:
+        sess = _require_session(params.session_id)
+        await asyncio.to_thread(sess.cmd_silence_add, params.mask)
+        return json.dumps({"status": "silenced", "mask": params.mask})
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool: irc_unsilence
+# ─────────────────────────────────────────────────────────────────────────────
+@mcp.tool(name="irc_unsilence", annotations={"title":"Remove a mask from SILENCE list","readOnlyHint":False,"destructiveHint":False,"idempotentHint":True,"openWorldHint":True})
+async def irc_unsilence(params: SilenceInput) -> str:
+    """
+    Remove a nick or hostmask from your server-side SILENCE list.
+
+    Args:
+        params (SilenceInput):
+            - session_id (str): Your session_id.
+            - mask (str): Nick or hostmask to unsilence.
+
+    Returns:
+        str: Confirmation.
+    """
+    try:
+        sess = _require_session(params.session_id)
+        await asyncio.to_thread(sess.cmd_silence_del, params.mask)
+        return json.dumps({"status": "unsilenced", "mask": params.mask})
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool: irc_setname
+# ─────────────────────────────────────────────────────────────────────────────
+@mcp.tool(name="irc_setname", annotations={"title":"Change your IRC realname/gecos field","readOnlyHint":False,"destructiveHint":False,"idempotentHint":True,"openWorldHint":True})
+async def irc_setname(params: SetnameInput) -> str:
+    """
+    Change your realname (gecos) field — the text shown after your
+    host in /whois output. Not all servers support SETNAME.
+
+    Args:
+        params (SetnameInput):
+            - session_id (str): Your session_id.
+            - realname (str): New realname to display in /whois.
+
+    Returns:
+        str: Confirmation.
+    """
+    try:
+        sess = _require_session(params.session_id)
+        await asyncio.to_thread(sess.cmd_setname, params.realname)
+        return json.dumps({"status": "setname_sent", "realname": params.realname})
     except ValueError as e:
         return json.dumps({"error": str(e)})
 
