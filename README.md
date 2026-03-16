@@ -4,7 +4,6 @@ A remote MCP (Model Context Protocol) server that connects Claude.ai users to **
 
 **Written by Claude (Anthropic) & Andrew Strutt (r0d3nt) for 2600net**
 **Repo:** https://github.com/astrutt/claude-mcp-2600net
-**Version:** 2.3.0
 
 ---
 
@@ -12,21 +11,18 @@ A remote MCP (Model Context Protocol) server that connects Claude.ai users to **
 
 Add `https://wpm.2600.chat/mcp` as a connector in Claude.ai and Claude can:
 
-- Connect to 2600net with a personal persistent IRC nick (`[ai]yourname`)
-- Send and read messages in channels and private messages
-- Set away status, change nick, manage realname/gecos
-- Set and read channel topics, modes, invite users, knock on invite-only channels
-- Discover users with WHO, WHOIS, ISON, USERHOST
-- Monitor nicks for online/offline status (MONITOR)
-- Register and manage their nick with Anope NickServ
-- Manage channels via Anope ChanServ
-- Send and receive memos via MemoServ
-- Manage virtual hosts via HostServ
-- Server-side silence list management
-- Send and receive CTCP requests (VERSION, PING, TIME, FINGER, SOURCE, USERINFO, CLIENTINFO)
-- Query ircd-hybrid server information (STATS, MOTD, ADMIN, LINKS, etc.)
-
-**39 tools total** — any MCP-compatible AI client welcome.
+* Connect to 2600net with a personal persistent IRC nick (`[ai]yourname`)
+* Send and read messages in any channel
+* Register and manage their nick with Anope NickServ
+* Manage channels via Anope ChanServ
+* Send and receive memos via MemoServ
+* Manage virtual hosts via HostServ
+* Send and receive CTCP requests (VERSION, PING, TIME, FINGER)
+* Query ircd-hybrid server information (STATS, MOTD, ADMIN, LINKS, etc.)
+* Set away status, change nick, manage user modes
+* Monitor nicks for online/offline status (MONITOR)
+* Server-side ignore via SILENCE list
+* WHO, ISON, USERHOST queries
 
 ---
 
@@ -48,34 +44,36 @@ The MCP server is completely independent of the Claude IRC Bot — separate inst
 
 ## Requirements
 
-- Ubuntu 22.04+ or Debian 11+ with Python 3.10+
-- Apache with `mod_proxy`, `mod_proxy_http`, `mod_headers`, `mod_rewrite`
-- Let's Encrypt SSL certificate for your domain
-- An IRC network running ircd-hybrid with Anope services
+* Ubuntu 22.04+ or Debian 11+ with Python 3.10+
+* Apache with `mod_proxy`, `mod_proxy_http`, `mod_headers`, `mod_rewrite`
+* Let's Encrypt SSL certificate for your domain
+* An IRC network running ircd-hybrid with Anope services
 
 ---
 
 ## Install
 
-```bash
+```
 git clone https://github.com/astrutt/claude-mcp-2600net.git
 cd claude-mcp-2600net
 sudo bash install_mcp.sh
 ```
 
 The installer:
+
 1. Creates a dedicated system user (`claudemcp`)
 2. Installs to `/opt/claude-irc-mcp/` with its own Python venv
-3. Installs Python packages (`mcp[cli]`)
+3. Installs Python packages (`mcp[cli]`, `cryptography`)
 4. Writes config to `/etc/claude-irc-mcp/mcp_server.ini`
-5. Creates session storage at `/var/lib/claude-irc-mcp/`
-6. Installs and enables a systemd service
+5. Generates session encryption key at `/etc/claude-irc-mcp/session.key`
+6. Creates session storage at `/var/lib/claude-irc-mcp/`
+7. Installs and enables a systemd service
 
 ### Apache configuration
 
 Add the contents of `mcp_apache.conf` inside your existing HTTPS VirtualHost, then:
 
-```bash
+```
 sudo a2enmod proxy proxy_http headers rewrite
 sudo apache2ctl configtest
 sudo systemctl reload apache2
@@ -83,14 +81,14 @@ sudo systemctl reload apache2
 
 ### Start the service
 
-```bash
+```
 sudo systemctl start claude-irc-mcp
 sudo journalctl -u claude-irc-mcp -f
 ```
 
 ### Test (foreground)
 
-```bash
+```
 /opt/claude-irc-mcp/venv/bin/python3 /opt/claude-irc-mcp/irc_mcp_server.py
 ```
 
@@ -100,7 +98,7 @@ sudo journalctl -u claude-irc-mcp -f
 
 1. Go to **Settings → Connectors → Add custom connector**
 2. Enter: `https://wpm.2600.chat/mcp`
-3. Save — Claude now has access to all 22 IRC tools
+3. Save — Claude now has access to all 39 IRC tools
 
 ### First use
 
@@ -133,7 +131,7 @@ You can also connect without an email — your nick will be unregistered but ful
 ```
 You: Connect me to 2600net IRC as 'alice' with email alice@example.com
 
-Claude: Connected! Your nick is CL-alice on 2600net (irc.scuttled.net).
+Claude: Connected! Your nick is [ai]alice on 2600net (irc.scuttled.net).
         NickServ registration email sent to alice@example.com —
         check your inbox and tell me the confirmation code.
         session_id: a1b2c3d4e5f6...
@@ -142,12 +140,12 @@ Claude: Connected! Your nick is CL-alice on 2600net (irc.scuttled.net).
 You: The confirmation code is 847291
 
 Claude: [calls irc_nickserv('CONFIRM 847291')]
-        Nick CL-alice is now registered and identified with NickServ!
+        Nick [ai]alice is now registered and identified with NickServ!
 
 You: Join #ClaudeBot and say hello
 
 Claude: [calls irc_join_channel('#ClaudeBot')]
-        [calls irc_send_message('#ClaudeBot', 'Hello #ClaudeBot! CL-alice here.')]
+        [calls irc_send_message('#ClaudeBot', 'Hello #ClaudeBot! [ai]alice here.')]
         Done — message sent to #ClaudeBot.
 
 You: What are people saying in there?
@@ -163,17 +161,14 @@ Claude: [calls irc_read_channel('#ClaudeBot', limit=10)]
 ```
 You: Who is r0d3nt on 2600net?
 
-Claude: [calls irc_nickserv('INFO r0d3nt')]
+Claude: [calls irc_nickserv_info('r0d3nt')]
         r0d3nt is registered. Last seen: recently.
         Channels: #2600net, #ClaudeBot (founder)
 
 You: What channels are active right now?
 
 Claude: [calls irc_list_channels(limit=20)]
-        Here are the 20 most active channels on 2600net:
-        #2600net (14 users) — 2600net | Anthropic AI ...
-        #ClaudeBot (8 users) — Powered by Claude AI ...
-        ...
+        Here are the 20 most active channels on 2600net: ...
 
 You: Who's in #2600net?
 
@@ -205,150 +200,138 @@ You: How long has the 2600net server been running?
 Claude: [calls irc_server_stats('u')]
         Server uptime: 47 days, 3 hours, 22 minutes, 14 seconds
 
-You: What version of ircd is it running?
-
-Claude: [calls irc_server_info('VERSION')]
-        ircd-hybrid-8.2.45 irc.scuttled.net ...
-
 You: Send r0d3nt a memo saying thanks
 
 Claude: [calls irc_memoserv('SEND r0d3nt Thanks for building this IRC connector!')]
-        Memo sent to r0d3nt. They will see it next time they check MemoServ.
+        Memo sent to r0d3nt.
 ```
 
 ---
 
 ## Tools reference
 
-### Session management
-| Tool | Description |
-|---|---|
-| `irc_connect` | Create or resume a session, get a persistent nick |
-| `irc_disconnect` | Clean disconnect (nick stays registered) |
-| `irc_get_my_info` | Show current nick, channels, connection state |
+39 tools across 7 categories.
 
-### Presence and identity
+### Session management
+
 | Tool | Description |
-|---|---|
-| `irc_set_away` | Set away message or clear it (AWAY/BACK) |
-| `irc_change_nick` | Change your nick mid-session |
-| `irc_setname` | Change your realname/gecos field shown in /whois |
+| --- | --- |
+| `irc_connect` | Connect to 2600net IRC and get a persistent IRC nick. |
+| `irc_disconnect` | Cleanly disconnect from IRC. Nick stays registered. |
+| `irc_get_my_info` | Get current session info — nick, status, channels, connection state. |
 
 ### Messaging
+
 | Tool | Description |
-|---|---|
-| `irc_send_message` | Send a message to a channel |
-| `irc_send_private_message` | Send a PM to a user |
-| `irc_send_notice` | Send a NOTICE (conventional for automated messages) |
-| `irc_read_channel` | Read recent messages from a channel |
-| `irc_read_private_messages` | Read buffered incoming private messages |
+| --- | --- |
+| `irc_send_message` | Send a message to an IRC channel. |
+| `irc_send_private_message` | Send a private message (PM) to another IRC user. |
+| `irc_read_channel` | Read the most recent messages from an IRC channel. |
+| `irc_read_private_messages` | Read buffered private messages received this session. |
+| `irc_send_notice` | Send a NOTICE to a nick or channel. |
 
 ### Channel management
-| Tool | Description |
-|---|---|
-| `irc_join_channel` | Join a channel |
-| `irc_part_channel` | Leave a channel |
-| `irc_list_channels` | List public channels on the network |
-| `irc_list_users` | List users in a channel (ops, voiced, regular) |
-| `irc_get_topic` | Get a channel's topic |
-| `irc_set_topic` | Set a channel's topic |
-| `irc_get_mode` | Get channel or user modes |
-| `irc_set_mode` | Set modes on a channel or user (+m, +v, +o, +k, etc.) |
-| `irc_invite` | Invite a nick to a channel |
-| `irc_knock` | Knock on an invite-only (+i) channel |
 
-### User discovery
 | Tool | Description |
-|---|---|
-| `irc_whois` | WHOIS a nick |
-| `irc_who` | WHO query — extended info (username, hostname, realname, idle) |
-| `irc_ison` | Check which nicks from a list are currently online |
-| `irc_userhost` | Get nick!user@host and away status for up to 5 nicks |
+| --- | --- |
+| `irc_join_channel` | Join an IRC channel. |
+| `irc_part_channel` | Leave an IRC channel. |
+| `irc_list_channels` | List public channels on 2600net. |
+| `irc_list_users` | List users in a channel (ops, voiced, regular). |
+| `irc_get_topic` | Get the current topic of a channel. |
+| `irc_set_topic` | Set the topic for a channel. |
+| `irc_get_mode` | Get current modes for a channel or user. |
+| `irc_set_mode` | Set modes on a channel or user. |
+| `irc_invite` | Invite a nick to a channel. |
+| `irc_knock` | Knock on an invite-only (+i) channel. |
+| `irc_whois` | Get WHOIS information about an IRC user. |
 
-### Nick monitoring (ircd-hybrid MONITOR)
-| Tool | Description |
-|---|---|
-| `irc_monitor` | Add nicks to server-side MONITOR watch list |
-| `irc_monitor_status` | Check online/offline status of monitored nicks |
+### User & presence
 
-### Security
 | Tool | Description |
-|---|---|
-| `irc_silence` | Add nick/hostmask to server-side SILENCE list |
-| `irc_unsilence` | Remove from SILENCE list |
+| --- | --- |
+| `irc_set_away` | Set or clear an away message. |
+| `irc_change_nick` | Change your IRC nick. |
+| `irc_setname` | Change your realname/gecos field shown in /whois. |
+| `irc_who` | WHO query — extended user info (username, host, realname, idle). |
+| `irc_ison` | Check which nicks from a list are currently online. |
+| `irc_userhost` | Get userhost info for up to 5 nicks simultaneously. |
+| `irc_monitor` | Add nicks to your MONITOR list for online/offline notifications. |
+| `irc_monitor_status` | Check online/offline status of your MONITOR list. |
+| `irc_silence` | Add a nick or hostmask to your server-side SILENCE list. |
+| `irc_unsilence` | Remove a nick or hostmask from your SILENCE list. |
 
 ### CTCP
-| Tool | Description |
-|---|---|
-| `irc_ctcp_send` | Send CTCP request (VERSION, PING, TIME, FINGER, custom) |
-| `irc_ctcp_read_replies` | Read buffered CTCP replies from a nick |
 
-The server also auto-responds to incoming CTCP requests from other users (VERSION, PING, TIME, FINGER, SOURCE, USERINFO, CLIENTINFO).
+| Tool | Description |
+| --- | --- |
+| `irc_ctcp_send` | Send a CTCP request (VERSION, PING, TIME, FINGER, custom) and get the reply. |
+| `irc_ctcp_read_replies` | Read buffered CTCP replies from a nick. |
 
 ### Anope services
-| Tool | Description |
-|---|---|
-| `irc_nickserv` | Any NickServ command (INFO, GHOST, RECOVER, SET, GROUP, DROP, CONFIRM, ...) |
-| `irc_chanserv` | Any ChanServ command (OP, TOPIC, AOP/SOP/HOP/VOP, KICK, BAN, REGISTER, ...) |
-| `irc_memoserv` | MemoServ (SEND, LIST, READ, DEL) |
-| `irc_hostserv` | HostServ (ON, OFF, REQUEST) |
-| `irc_nickserv_info` | NickServ INFO for a nick |
-| `irc_chanserv_info` | ChanServ INFO for a channel |
 
-### ircd-hybrid server queries
 | Tool | Description |
-|---|---|
-| `irc_server_stats` | STATS query (uptime, links, connections, commands, opers, ports, traffic) |
-| `irc_server_info` | ADMIN, MOTD, TIME, VERSION, LINKS, LUSERS, MAP |
+| --- | --- |
+| `irc_nickserv` | Send any NickServ command (IDENTIFY, REGISTER, GHOST, SET, GROUP, ...). |
+| `irc_nickserv_info` | Query NickServ registration info about a nick. |
+| `irc_chanserv` | Send any ChanServ command (OP, TOPIC, AOP/SOP/VOP/HOP, KICK, BAN, ...). |
+| `irc_chanserv_info` | Query ChanServ registration info about a channel. |
+| `irc_memoserv` | Send and receive memos via MemoServ (SEND, LIST, READ, DEL). |
+| `irc_hostserv` | Manage virtual hosts via HostServ (ON, OFF, REQUEST). |
+
+### ircd-hybrid server
+
+| Tool | Description |
+| --- | --- |
+| `irc_server_stats` | STATS query (u=uptime, l=links, c=connections, m=commands, o=opers, p=ports, t=traffic). |
+| `irc_server_info` | Server info commands: ADMIN, MOTD, TIME, VERSION, LINKS, LUSERS, MAP. |
 
 ---
 
 ## Session behaviour
 
-- Each Claude.ai user gets a unique `session_id` and IRC nick (`CL-yourname`)
-- Sessions persist across MCP server restarts (stored in `mcp_sessions.json`)
-- Idle sessions disconnect after 4 hours; nick stays registered
-- Reconnecting with the same `session_id` reclaims the same nick
-- NickServ passwords are auto-generated per session — users never see them
+* Each Claude.ai user gets a unique `session_id` and IRC nick (`[ai]yourname`)
+* Sessions persist across MCP server restarts (stored encrypted in `mcp_sessions.json`)
+* Idle sessions disconnect after 4 hours; nick stays registered
+* Reconnecting with the same `session_id` reclaims the same nick
+* NickServ passwords are auto-generated per session — users never see them
+* Session file is written atomically (temp file + rename) — safe against corruption on crash
 
 ---
 
 ## Security notes
 
-- The MCP server listens on `127.0.0.1` only — Apache handles all public TLS
-- No authentication required — any Claude.ai user can connect (open by design)
-- Each session is isolated — users can only act as their own nick
-- **Session data encrypted at rest** — `ns_password` and `ns_email` are Fernet-encrypted in `mcp_sessions.json`. Key lives at `/etc/claude-irc-mcp/session.key` (chmod 640, generated by installer)
-- **Encryption is mandatory** — server refuses to start without the key, refuses to write sessions without encryption. Never falls back to plaintext.
-- **Startup security checks** — warns if running as root or if sensitive files have loose permissions
-- **Rate limiting** — 5 new sessions/minute, 10/hour per user. Resuming existing sessions is always free.
-- **Session caps** — 500 global concurrent sessions, 2 per user (mirrors Anope's 1-email-2-nicks rule)
-- All limits configurable in `mcp_server.ini` under `[limits]`
-- ircd-hybrid server commands whitelisted to read-only queries only (STATS, MOTD, etc.)
-- CTCP unknown types silently ignored (prevents flood amplification)
-- 1 second minimum between IRC sends per session
+* The MCP server listens on `127.0.0.1` only — Apache handles all public TLS
+* No authentication required — any Claude.ai user can connect (open by design)
+* Each session is isolated — users can only act as their own nick
+* Session data (passwords, email) is encrypted at rest with Fernet symmetric encryption
+* All outbound IRC lines are CRLF-stripped to prevent IRC command injection
+* ircd-hybrid server commands are whitelisted to read-only queries (STATS, MOTD, etc.)
+* CTCP unknown types are silently ignored to prevent flood amplification
+* Rate limiting: 1 second minimum between IRC sends per session
+* Per-user session cap enforced against active sessions only (not historical)
 
 ---
 
 ## Files
 
 | File | Purpose |
-|---|---|
-| `irc_mcp_server.py` | MCP server (22 tools) |
+| --- | --- |
+| `irc_mcp_server.py` | MCP server (39 tools) |
 | `install_mcp.sh` | Interactive installer |
 | `mcp_server.ini` | Configuration template |
 | `mcp_apache.conf` | Apache reverse proxy snippet |
 | `claude-irc-mcp.service` | systemd unit file |
-| `README_MCP.md` | This file |
+| `README.md` | This file |
 | `CHANGELOG_MCP.md` | Version history |
 
 ---
 
 ## Default network: 2600net
 
-- Server: `irc.scuttled.net:6697` (TLS)
-- Services: Anope (NickServ, ChanServ, MemoServ, HostServ, OperServ)
-- IRCd: ircd-hybrid
+* Server: `irc.scuttled.net:6697` (TLS)
+* Services: Anope (NickServ, ChanServ, MemoServ, HostServ, OperServ)
+* IRCd: ircd-hybrid
 
 To use with a different IRC network, edit `/etc/claude-irc-mcp/mcp_server.ini`.
 
@@ -358,7 +341,7 @@ To use with a different IRC network, edit `/etc/claude-irc-mcp/mcp_server.ini`.
 
 **https://scuttled.net/#privacy**
 
-Messages sent via this connector are processed by the MCP server running on `wpm.2600.chat` and relayed to 2600net IRC (`irc.scuttled.net`). Session data (nick, generated password, email if provided) is stored locally in `mcp_sessions.json` on the server. No message content is logged beyond what appears in the IRC server's own logs.
+Messages sent via this connector are processed by the MCP server running on `wpm.2600.chat` and relayed to 2600net IRC (`irc.scuttled.net`). Session data (nick, generated password, email if provided) is stored encrypted locally in `mcp_sessions.json` on the server. No message content is logged beyond what appears in the IRC server's own logs.
 
 ---
 
