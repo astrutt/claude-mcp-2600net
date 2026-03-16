@@ -5,6 +5,73 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [2.3.0] — 2026-03-16
+
+### Added
+
+**17 new MCP tools — total now 39**
+
+*Presence and identity:*
+- `irc_set_away` — set an away message or clear it (AWAY/BACK). Configurable by the user — set whatever message reflects what your AI is doing for you.
+- `irc_change_nick` — change your nick mid-session without reconnecting
+- `irc_setname` — change your realname/gecos field shown in /whois (SETNAME)
+
+*Channel management:*
+- `irc_set_topic` — set a channel topic directly (previously read-only)
+- `irc_get_mode` — get current modes for a channel or your own user modes
+- `irc_set_mode` — set modes on a channel or user (+m, +v, +o, +k, etc.)
+- `irc_invite` — invite a nick to a channel (required for +i channels)
+- `irc_knock` — knock on an invite-only channel to request entry
+
+*User discovery:*
+- `irc_who` — WHO query with extended info (username, hostname, realname, idle)
+- `irc_ison` — check which nicks from a list are currently online
+- `irc_userhost` — get nick!user@host and away status for up to 5 nicks simultaneously
+
+*Nick monitoring (ircd-hybrid MONITOR):*
+- `irc_monitor` — add nicks to server-side MONITOR watch list
+- `irc_monitor_status` — check current online/offline status of monitored nicks
+- Server sends 730/731 notifications when monitored nicks come online/offline
+
+*Messaging:*
+- `irc_send_notice` — send a NOTICE instead of PRIVMSG (conventional for automated/informational messages)
+- `irc_read_private_messages` — read buffered incoming PMs (previously lost — now buffered per sender up to 100 messages)
+
+*Security:*
+- `irc_silence` — add a nick or hostmask to server-side SILENCE list (ircd-hybrid specific)
+- `irc_unsilence` — remove from SILENCE list
+
+**IRCSession improvements:**
+- PM buffer — incoming private messages now buffered per sender (`pm_buffer`)
+- Away state tracked (`away_message` attribute)
+- Channel mode cache (`channel_modes` dict, updated on 324/MODE)
+- WHO reply buffer (`_who_buf`, `_who_event`)
+- ISON reply buffer (`_ison_result`, `_ison_event`)
+- USERHOST reply buffer (`_userhost_buf`, `_userhost_event`)
+- MONITOR state tracking (`_monitor_online`, `_monitor_offline`, `_monitor_list`)
+- Additional WHOIS numerics handled: 313 (IRCop), 330 (logged in as), 338 (actually using host), 378/379 (connecting from)
+- 305/306 numerics handled (RPL_UNAWAY/RPL_NOWAWAY)
+- 221 numeric handled (RPL_UMODEIS — user modes)
+- 324/329 numerics handled (RPL_CHANNELMODEIS)
+- 352/354/315 numerics handled (WHO reply/end)
+- 303 numeric handled (ISON reply)
+- 302 numeric handled (USERHOST reply)
+- 730/731/732/733 numerics handled (MONITOR online/offline/list/end)
+- MODE command handled — updates channel mode cache
+
+### Changed
+
+- Version bumped to v2.3
+- CTCP VERSION response updated to v2.3
+- Nick prefix configurable via `mcp_server.ini` `[irc] nick_prefix` — default `[ai]`
+- CORS origins configurable via `mcp_server.ini` `[mcp] cors_origins` — default `https://claude.ai` (keep during Anthropic audit)
+- Unused `NS_EMAIL` / `ns_email` config item removed — users supply their own email via `irc_connect(email=...)`
+- IRC port renamed from `port` to `tls_port` in config for clarity
+- Nick prefix values containing `[` or `]` must be quoted in ini file (e.g. `nick_prefix = "[ai]"`) to avoid configparser treating them as section headers. Server strips quotes automatically.
+- Log format uses seconds only (`datefmt="%Y-%m-%d %H:%M:%S"`)
+
+---
+
 ## [2.2.0] — 2026-03-16
 
 ### Added
