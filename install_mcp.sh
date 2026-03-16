@@ -126,15 +126,27 @@ cat > /etc/claude-irc-mcp/mcp_server.ini <<EOCONF
 # Owner: root:${SYS_USER}   Permissions: 640
 
 [irc]
-server    = ${IRC_SERVER}
-port      = ${IRC_PORT}
+server      = ${IRC_SERVER}
+tls_port    = ${IRC_PORT}
+# Nick prefix for all MCP sessions. Quote values containing [ or ]
+nick_prefix = "[ai]"
 
 [mcp]
-host      = 127.0.0.1
-port      = ${MCP_PORT}
+host        = 127.0.0.1
+port        = ${MCP_PORT}
+public_host = ${IRC_SERVER}
+# CORS origins for browser-based clients (comma-separated or *)
+# Keep as claude.ai during Anthropic audit period
+cors_origins = https://claude.ai
 
 [sessions]
 idle_timeout_hours = 4
+
+[limits]
+max_sessions_global     = 500
+max_sessions_per_user   = 2
+connect_rate_per_minute = 5
+connect_rate_per_hour   = 10
 EOCONF
 
 chown "root:${SYS_USER}" /etc/claude-irc-mcp/mcp_server.ini

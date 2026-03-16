@@ -64,7 +64,6 @@ VERSION          = "2600net IRC MCP Server v2.2 | Claude (Anthropic) & Andrew St
 CONFIG_PATH      = "/etc/claude-irc-mcp/mcp_server.ini"
 SESSIONS_PATH    = "/var/lib/claude-irc-mcp/mcp_sessions.json"
 SESSION_KEY_FILE = "/etc/claude-irc-mcp/session.key"  # Fernet key for session encryption
-NICK_PREFIX      = "CL-"
 NICK_MAX_LEN     = 15                  # IRC standard max nick length
 IDLE_TIMEOUT_S   = 4 * 3600           # 4 hours
 CONNECT_TIMEOUT  = 30
@@ -74,17 +73,23 @@ SEND_RATE_S      = 1.0                 # min seconds between sends
 LIST_MAX         = 100                 # max channels to return from LIST
 
 # ── Config ────────────────────────────────────────────────────────────────────
-def _load_config() -> configparser.ConfigParser:
-    cfg = configparser.ConfigParser()
+def _load_config() -> configparser.RawConfigParser:
+    cfg = configparser.RawConfigParser()
     cfg.read(CONFIG_PATH)
     return cfg
 
 _cfg = _load_config()
-IRC_SERVER   = _cfg.get("irc", "server",   fallback="irc.scuttled.net")
-IRC_PORT     = _cfg.getint("irc", "port",  fallback=6697)
-NS_EMAIL     = _cfg.get("irc", "ns_email", fallback="irc-mcp@2600.chat")
-MCP_HOST     = _cfg.get("mcp", "host",    fallback="127.0.0.1")
-MCP_PORT     = _cfg.getint("mcp", "port", fallback=8765)
+IRC_SERVER   = _cfg.get("irc", "server",      fallback="irc.scuttled.net")
+IRC_PORT     = _cfg.getint("irc", "tls_port",  fallback=6697)
+MCP_HOST     = _cfg.get("mcp", "host",        fallback="127.0.0.1")
+MCP_PORT     = _cfg.getint("mcp", "port",     fallback=8765)
+# Nick prefix for all MCP sessions — visible in nicklist and /whois
+NICK_PREFIX  = _cfg.get("irc", "nick_prefix", fallback="[ai]")
+# CORS allowed origins — comma-separated list, or * for all
+# Only affects browser-based MCP clients (Claude.ai, etc.)
+# Desktop clients (Claude Desktop, Cursor, etc.) are unaffected by this setting
+_cors_raw    = _cfg.get("mcp", "cors_origins", fallback="https://claude.ai")
+CORS_ORIGINS = [o.strip() for o in _cors_raw.split(",") if o.strip()]
 
 # ── Limits (all configurable in mcp_server.ini [limits] section) ──────────────
 _lim = _cfg["limits"] if "limits" in _cfg else {}
@@ -105,7 +110,8 @@ def _irc_lower(s: str) -> str:
 def _sanitize_name(name: str) -> str:
     """
     Turn a user-supplied name into a valid IRC nick suffix.
-    Keeps alphanumerics and hyphens, truncates to fit NICK_MAX_LEN.
+    Keeps alphanumerics and hyphens, truncates to fit within NICK_MAX_LEN
+    after the configured prefix is prepended.
     """
     clean = re.sub(r"[^a-zA-Z0-9\-]", "", name)
     if not clean:
@@ -757,14 +763,27 @@ class IRCSession:
         log.info(f"[{self.session_id[:8]}] CTCP {command} from {sender}")
 
         if command == "VERSION":
-            self._send_raw(f"NOTICE {sender} :\x01VERSION 2600net IRC MCP Connector v2.2 | Claude (Anthropic) & Andrew Strutt (r0d3nt)\x01")
+            self._send_raw(f"NOTICE {sender} :\x01VERSION 2600net IRC MCP Connector v2.2 | AI MCP Gateway | github.com/astrutt/claude-mcp-2600net\x01")
         elif command == "PING":
             self._send_raw(f"NOTICE {sender} :\x01PING {arg}\x01")
         elif command == "TIME":
             t = time.strftime("%a %b %d %H:%M:%S UTC %Y", time.gmtime())
             self._send_raw(f"NOTICE {sender} :\x01TIME {t}\x01")
         elif command == "FINGER":
-            self._send_raw(f"NOTICE {sender} :\x01FINGER Claude AI MCP Session on 2600net\x01")
+            self._send_raw(
+                f"NOTICE {sender} :\x01FINGER AI MCP session on 2600net IRC "
+                f"| github.com/astrutt/claude-mcp-2600net\x01"
+            )
+        elif command == "SOURCE":
+            self._send_raw(f"NOTICE {sender} :\x01SOURCE https://github.com/astrutt/claude-mcp-2600net\x01")
+        elif command == "USERINFO":
+            self._send_raw(
+                f"NOTICE {sender} :\x01USERINFO AI MCP session on 2600net. "
+                f"Any MCP-compatible AI client welcome. "
+                f"github.com/astrutt/claude-mcp-2600net\x01"
+            )
+        elif command == "CLIENTINFO":
+            self._send_raw(f"NOTICE {sender} :\x01CLIENTINFO VERSION PING TIME FINGER SOURCE USERINFO CLIENTINFO\x01")
         # Unknown CTCP — silently ignore (prevents amplification)
 
     def _handle_ctcp_reply(self, sender: str, body: str) -> None:
@@ -2237,6 +2256,7 @@ if __name__ == "__main__":
     log.info(f"Starting {VERSION}")
     log.info(f"IRC server: {IRC_SERVER}:{IRC_PORT}")
     log.info(f"MCP endpoint: http://{MCP_HOST}:{MCP_PORT}/mcp")
+    log.info(f"Nick prefix: {NICK_PREFIX}  CORS origins: {', '.join(CORS_ORIGINS)}")
 
     # FastMCP's transport_security middleware rejects requests where the Host
     # header doesn't match the bound address. Behind a reverse proxy the Host
