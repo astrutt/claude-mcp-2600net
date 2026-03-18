@@ -31,6 +31,7 @@ import socket
 import threading
 import time
 import configparser
+import sys
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -44,8 +45,7 @@ try:
     _FERNET_AVAILABLE = True
 except ImportError:
     _FERNET_AVAILABLE = False
-    log.warning("cryptography package not installed — session data will NOT be encrypted. "
-                "Run: pip install cryptography")
+    _CRYPTO_MISSING_WARNING = True
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -58,6 +58,10 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("irc_mcp")
+
+if not _FERNET_AVAILABLE:
+    log.warning("cryptography package not installed — session data will NOT be encrypted. "
+                "Run: pip install cryptography")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 VERSION          = "2600net IRC MCP Server v2.3 | Claude (Anthropic) & Andrew Strutt (r0d3nt) | github.com/astrutt/claude-mcp-2600net"
@@ -251,7 +255,10 @@ def _save_sessions(data: dict) -> None:
         path = Path(SESSIONS_PATH)
         path.parent.mkdir(parents=True, exist_ok=True)
         encrypted = {sid: _encrypt_meta(meta) for sid, meta in data.items()}
-        path.write_text(json.dumps(encrypted, indent=2))
+        # Atomic write: write to .tmp then os.replace() — safe on crash
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(encrypted, indent=2))
+        os.replace(tmp, path)
         # Warn if permissions are too open
         _warn_permissions(SESSIONS_PATH, {"0o640", "0o600"}, "sessions file")
     except Exception as e:
@@ -264,6 +271,7 @@ def _check_runtime_security() -> None:
     Missing encryption key = hard failure (sys.exit).
     Everything else = warning in logs, service continues.
     """
+    import sys
     # ── Hard failure: missing session encryption key ───────────────────────
     if not Path(SESSION_KEY_FILE).exists():
         log.error("=" * 60)
@@ -357,11 +365,20 @@ class IRCSession:
         # Identification event — tools can wait on this
         self._identified_event = threading.Event()
 
+        # Connection event — set once TLS handshake completes
+        self._connected_event = threading.Event()
+
         # CTCP reply buffer: nick → deque of {"ts", "type", "response"}
         self.ctcp_replies: dict[str, deque] = defaultdict(
             lambda: deque(maxlen=20)
         )
         self._ctcp_lock = threading.Lock()
+
+        # Per-operation locks — prevent concurrent calls from racing on shared buffers
+        self._who_lock      = threading.Lock()
+        self._ison_lock     = threading.Lock()
+        self._userhost_lock = threading.Lock()
+        self._ircd_lock     = threading.Lock()
 
         # Generic services notice buffers (MemoServ, HostServ, OperServ)
         self._memo_notice_buf:  list[str] = []
@@ -419,6 +436,7 @@ class IRCSession:
             tls.settimeout(None)
             self._sock     = tls
             self.connected = True
+            self._connected_event.set()   # ── FIX B: signal socket is ready ──
             log.info(f"[{self.session_id[:8]}] TLS connected as {self.nick}")
             self._send_raw(f"NICK {self.nick}")
             self._send_raw(f"USER claude 0 * :Claude AI MCP User")
@@ -426,6 +444,7 @@ class IRCSession:
         except Exception as e:
             log.error(f"[{self.session_id[:8]}] Connection error: {e}")
             self.connected = False
+            self._connected_event.set()   # unblock any waiter so it doesn't hang
 
     def _read_loop(self) -> None:
         buf = ""
@@ -445,6 +464,13 @@ class IRCSession:
         self.connected = False
 
     def _send_raw(self, line: str) -> None:
+        # ── SECURITY: strip CRLF to prevent IRC command injection ──────────
+        if "\r" in line or "\n" in line:
+            log.warning(
+                f"[{self.session_id[:8]}] CRLF stripped from outbound IRC line — "
+                f"possible injection attempt: {repr(line[:120])}"
+            )
+            line = line.replace("\r", "").replace("\n", "")
         with self._send_lock:
             now = time.monotonic()
             gap = now - self._last_send
@@ -463,6 +489,7 @@ class IRCSession:
 
     def disconnect(self, reason: str = "Session ended") -> None:
         self._running = False
+        self._connected_event.clear()   # ── FIX B: clear on disconnect ──
         try:
             self._send_raw(f"QUIT :{reason}")
             time.sleep(0.3)
@@ -773,12 +800,12 @@ class IRCSession:
             )
             self._ns_notice_event.set()
 
-        # Collect INFO response lines
-        self._ns_notice_buf.append(text)
-        # Signal if this looks like the end of an INFO block
-        if any(k in tl for k in ("end of info", "*** end", "last seen",
-                                  "options:", "email:", "url:")):
-            self._ns_notice_event.set()
+        # Collect INFO response lines — only when a command is actively waiting
+        if not self._ns_notice_event.is_set():
+            self._ns_notice_buf.append(text)
+            if any(k in tl for k in ("end of info", "*** end", "last seen",
+                                      "options:", "email:", "url:")):
+                self._ns_notice_event.set()
 
     def _ns_do_register(self) -> None:
         if not self.ns_email:
@@ -908,28 +935,31 @@ class IRCSession:
 
     def cmd_who(self, target: str, operators_only: bool = False) -> list[str]:
         self.last_active = time.monotonic()
-        self._who_buf.clear()
-        self._who_event.clear()
-        cmd = f"WHO {target} o" if operators_only else f"WHO {target}"
-        self._send_raw(cmd)
-        self._who_event.wait(timeout=CMD_TIMEOUT)
-        return list(self._who_buf)
+        with self._who_lock:
+            self._who_buf.clear()
+            self._who_event.clear()
+            cmd = f"WHO {target} o" if operators_only else f"WHO {target}"
+            self._send_raw(cmd)
+            self._who_event.wait(timeout=CMD_TIMEOUT)
+            return list(self._who_buf)
 
     def cmd_ison(self, nicks: list) -> list:
         self.last_active = time.monotonic()
-        self._ison_result = ""
-        self._ison_event.clear()
-        self._send_raw(f"ISON {' '.join(nicks)}")
-        self._ison_event.wait(timeout=CMD_TIMEOUT)
-        return self._ison_result.split() if self._ison_result else []
+        with self._ison_lock:
+            self._ison_result = ""
+            self._ison_event.clear()
+            self._send_raw(f"ISON {' '.join(nicks)}")
+            self._ison_event.wait(timeout=CMD_TIMEOUT)
+            return self._ison_result.split() if self._ison_result else []
 
     def cmd_userhost(self, nicks: list) -> list:
         self.last_active = time.monotonic()
-        self._userhost_buf.clear()
-        self._userhost_event.clear()
-        self._send_raw(f"USERHOST {' '.join(nicks[:5])}")
-        self._userhost_event.wait(timeout=CMD_TIMEOUT)
-        return list(self._userhost_buf)
+        with self._userhost_lock:
+            self._userhost_buf.clear()
+            self._userhost_event.clear()
+            self._send_raw(f"USERHOST {' '.join(nicks[:5])}")
+            self._userhost_event.wait(timeout=CMD_TIMEOUT)
+            return list(self._userhost_buf)
 
     def cmd_monitor_add(self, nicks: list) -> None:
         self.last_active = time.monotonic()
@@ -982,10 +1012,12 @@ class IRCSession:
             all_pms.extend(msgs)
         return sorted(all_pms, key=lambda m: m["ts"])
 
+    def wait_for_connect(self, timeout: float = CONNECT_TIMEOUT) -> bool:
+        """Block until the TLS socket is up. Returns True if connected within timeout."""
+        return self._connected_event.wait(timeout=timeout)
+
     def wait_for_identification(self, timeout: float = 30.0) -> bool:
         return self._identified_event.wait(timeout=timeout)
-
-
 
     def _handle_ctcp_request(self, sender: str, body: str) -> None:
         """Respond to incoming CTCP requests."""
@@ -1102,12 +1134,13 @@ class IRCSession:
         end_numeric: the final numeric that signals end of reply block.
         """
         self.last_active = time.monotonic()
-        self._ircd_buf.clear()
-        self._ircd_event.clear()
-        self._send_raw(raw_command)
-        # Wait for end signal or timeout
-        self._ircd_event.wait(timeout=CMD_TIMEOUT)
-        return list(self._ircd_buf)
+        with self._ircd_lock:
+            self._ircd_buf.clear()
+            self._ircd_event.clear()
+            self._send_raw(raw_command)
+            # Wait for end signal or timeout
+            self._ircd_event.wait(timeout=CMD_TIMEOUT)
+            return list(self._ircd_buf)
 
     # ── Extended NickServ / ChanServ commands ───────────────────────────────
 
@@ -1128,9 +1161,6 @@ class IRCSession:
         self._send_raw(f"PRIVMSG ChanServ :{command}")
         self._cs_notice_event.wait(timeout=CMD_TIMEOUT)
         return list(self._cs_notice_buf)
-
-    def wait_for_identification(self, timeout: float = 30.0) -> bool:
-        return self._identified_event.wait(timeout=timeout)
 
 
 # ── Connect rate limiter ──────────────────────────────────────────────────────
@@ -1255,17 +1285,17 @@ class SessionPool:
                 "Please try again later."
             )
 
-        # 2. Per-user session cap — count active sessions for this name
+        # 2. Per-user session cap — count ACTIVE sessions only (not historical _meta)
         nick = _make_nick(desired_name)
         with self._lock:
             user_count = sum(
-                1 for meta in self._meta.values()
-                if _irc_lower(meta.get("nick", "")) == _irc_lower(nick)
-                or _irc_lower(meta.get("nick", "")).startswith(_irc_lower(nick))
+                1 for sess in self._sessions.values()
+                if _irc_lower(sess.nick) == _irc_lower(nick)
+                or _irc_lower(sess.nick).startswith(_irc_lower(nick))
             )
         if user_count >= LIMIT_SESSIONS_PER_USER:
             return False, (
-                f"Maximum of {LIMIT_SESSIONS_PER_USER} sessions allowed per user. "
+                f"Maximum of {LIMIT_SESSIONS_PER_USER} active sessions allowed per user. "
                 "Resume an existing session_id or disconnect one first."
             )
 
@@ -1277,7 +1307,21 @@ class SessionPool:
         return True, ""
 
     def create(self, desired_name: str, ns_email: str = "") -> tuple[str, IRCSession]:
-        """Create a brand-new session — limits must be checked before calling this."""
+        """Create a brand-new session — limits must be checked before calling this.
+        Re-checks per-user cap under lock to close TOCTOU between check_limits/create.
+        """
+        nick = _make_nick(desired_name)
+        with self._lock:
+            active = sum(
+                1 for s in self._sessions.values()
+                if _irc_lower(s.nick) == _irc_lower(nick)
+                or _irc_lower(s.nick).startswith(_irc_lower(nick))
+            )
+            if active >= LIMIT_SESSIONS_PER_USER:
+                raise ValueError(
+                    f"Maximum of {LIMIT_SESSIONS_PER_USER} active sessions per user reached. "
+                    "Resume an existing session_id or disconnect one first."
+                )
         session_id = secrets.token_hex(16)
         nick       = _make_nick(desired_name)
         ns_pass    = secrets.token_urlsafe(24)
@@ -1333,13 +1377,22 @@ _pool = SessionPool()
 
 # ── Helpers for tools ─────────────────────────────────────────────────────────
 def _require_session(session_id: str) -> IRCSession:
-    """Retrieve session or raise ValueError with helpful message."""
+    """Retrieve session or raise ValueError with helpful message.
+    Waits for the TLS socket to be ready if the session was just reconnected.
+    """
     sess = _pool.resume(session_id)
     if not sess:
         raise ValueError(
             "Session not found. Call irc_connect first to create a session, "
             "then save the returned session_id in your custom instructions."
         )
+    if not sess.connected:
+        log.info(f"[{session_id[:8]}] Waiting for connection to be ready...")
+        if not sess.wait_for_connect(timeout=CONNECT_TIMEOUT):
+            raise ValueError(
+                "IRC connection timed out. The server may be unreachable. "
+                "Try irc_connect again to reconnect."
+            )
     return sess
 
 
@@ -1369,11 +1422,15 @@ class ConnectInput(BaseModel):
 
 class SessionInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id returned by irc_connect.")
+    session_id: str = Field(
+        ...,
+        description="Your session_id returned by irc_connect.",
+        pattern=r"^[0-9a-f]{32}$",
+    )
 
 class SendMessageInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
     channel:    str = Field(..., description="Channel name (e.g. '#ClaudeBot').")
     message:    str = Field(..., description="Message to send.", min_length=1, max_length=400)
 
@@ -1386,29 +1443,29 @@ class SendMessageInput(BaseModel):
 
 class SendPMInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
     target:     str = Field(..., description="Nick to send a private message to.")
     message:    str = Field(..., description="Message text.", min_length=1, max_length=400)
 
 class ReadChannelInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
     channel:    str = Field(..., description="Channel to read (e.g. '#ClaudeBot').")
     limit:      int = Field(default=20, description="Number of recent messages to return.", ge=1, le=100)
 
 class ChannelInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
     channel:    str = Field(..., description="Channel name (e.g. '#ClaudeBot').")
 
 class NickInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
     nick:       str = Field(..., description="IRC nick to look up.")
 
 class ListChannelsInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
     limit:      int = Field(default=50, description="Max channels to return.", ge=1, le=LIST_MAX)
 
 
@@ -1416,82 +1473,87 @@ class ListChannelsInput(BaseModel):
 
 class CtcpSendInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
     nick:       str = Field(..., description="Target IRC nick.")
     ctcp_type:  str = Field(..., description="CTCP type: VERSION, PING, TIME, FINGER, or any custom type.")
     arg:        str = Field(default="", description="Optional argument (e.g. timestamp for PING).")
 
 class CtcpReadInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
     nick:       str = Field(..., description="Nick whose CTCP replies to read.")
 
 class NickServInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
     command:    str = Field(..., description="NickServ command and arguments (e.g. 'GHOST OldNick password', 'SET URL https://...', 'GROUP').", min_length=1, max_length=300)
 
 class ChanServInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
     command:    str = Field(..., description="ChanServ command and arguments (e.g. 'OP #channel nick', 'TOPIC #channel New topic', 'AOP #channel ADD nick').", min_length=1, max_length=300)
 
 class MemoServInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
     command:    str = Field(..., description="MemoServ command (e.g. 'SEND nick Message text', 'LIST', 'READ 1', 'DEL 1').", min_length=1, max_length=300)
 
 class HostServInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
     command:    str = Field(..., description="HostServ command: 'ON', 'OFF', or 'REQUEST vhost.example.com'.", min_length=1, max_length=100)
 
 class IrcdStatsInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
     query:      str = Field(..., description="STATS query letter: u=uptime, l=links, c=connections, m=commands, o=opers, p=ports, t=traffic.", min_length=1, max_length=1)
 
 class IrcdCommandInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
     command:    str = Field(..., description="Raw ircd command to send (e.g. 'ADMIN', 'MOTD', 'TIME', 'VERSION', 'LINKS', 'LUSERS').", min_length=1, max_length=100)
 
 class AwayInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
     message:    str = Field(default="", description="Away message. Leave blank to clear away status and mark yourself as back.", max_length=200)
 
 class ChangeNickInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
-    new_nick:   str = Field(..., description="New nick to use. Must be a valid IRC nick.", min_length=1, max_length=15)
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
+    new_nick:   str = Field(
+        ...,
+        description="New nick to use. Must be a valid IRC nick (letters, digits, hyphens, underscores only).",
+        min_length=1, max_length=15,
+        pattern=r"^[a-zA-Z0-9\-\_\[\]\{\}\\|`^]+$",
+    )
 
 class SetTopicInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
     channel:    str = Field(..., description="Channel to set topic on (e.g. '#ClaudeBot').")
     topic:      str = Field(..., description="New topic text.", max_length=390)
 
 class GetModeInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
     target:     str = Field(default="", description="Channel or nick to get modes for. Leave blank for your own user modes.")
 
 class SetModeInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
     target:     str = Field(..., description="Channel or nick to set modes on.")
     modes:      str = Field(..., description="Mode string e.g. '+m', '+v nick', '-o nick', '+k secretkey'.", max_length=100)
 
 class InviteInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
     nick:       str = Field(..., description="Nick to invite.")
     channel:    str = Field(..., description="Channel to invite them to.")
 
 class KnockInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
     channel:    str = Field(..., description="Invite-only channel to knock on.")
     message:    str = Field(default="", description="Optional message to include with the knock.", max_length=200)
 
@@ -1518,24 +1580,24 @@ class MonitorInput(BaseModel):
 
 class SendNoticeInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
     target:     str = Field(..., description="Nick or channel to send NOTICE to.")
     message:    str = Field(..., description="Notice text.", min_length=1, max_length=400)
 
 class ReadPMsInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
     nick:       str = Field(default="", description="Filter to PMs from a specific nick. Leave blank for all PMs.")
     limit:      int = Field(default=20, description="Number of recent PMs to return.", ge=1, le=100)
 
 class SilenceInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
     mask:       str = Field(..., description="Nick or hostmask to silence (e.g. 'annoyingnick' or '*!*@spammer.host').", min_length=1, max_length=100)
 
 class SetnameInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    session_id: str = Field(..., description="Your session_id.")
+    session_id: str = Field(..., description="Your session_id.", pattern=r"^[0-9a-f]{32}$")
     realname:   str = Field(..., description="New realname/gecos field shown in /whois.", min_length=1, max_length=50)
 
 
@@ -1614,9 +1676,12 @@ async def irc_connect(params: ConnectInput) -> str:
             })
 
         ns_email = params.email or ""
-        session_id, sess = await asyncio.to_thread(
-            _pool.create, params.desired_name, ns_email
-        )
+        try:
+            session_id, sess = await asyncio.to_thread(
+                _pool.create, params.desired_name, ns_email
+            )
+        except ValueError as e:
+            return json.dumps({"error": "session_limit", "reason": str(e)})
 
         # Wait up to 30s for NickServ identification (only fires if nick was
         # already registered from a previous session)
@@ -2575,8 +2640,7 @@ async def irc_set_away(params: AwayInput) -> str:
     Args:
         params (AwayInput):
             - session_id (str): Your session_id.
-            - message (str): Away message (e.g. 'Busy doing things for you in #pirates').
-              Leave blank to clear away status.
+            - message (str): Away message. Leave blank to clear away status.
 
     Returns:
         str: Confirmation of away status.
@@ -2652,14 +2716,6 @@ async def irc_get_mode(params: GetModeInput) -> str:
     """
     Get current modes for a channel or user.
 
-    Common channel modes (ircd-hybrid):
-      +n  no external messages   +t  topic by ops only   +m  moderated
-      +i  invite only            +k  key (password)       +l  user limit
-      +s  secret (hidden in LIST)+p  private
-
-    Common user modes:
-      +i  invisible   +o  IRC operator   +x  hostname cloaking
-
     Args:
         params (GetModeInput):
             - session_id (str): Your session_id.
@@ -2688,14 +2744,6 @@ async def irc_set_mode(params: SetModeInput) -> str:
     """
     Set modes on a channel or user. Requires appropriate permissions.
 
-    Examples:
-      +m #channel          — make channel moderated
-      -m #channel          — remove moderated
-      +v nick #channel     — give voice to a user
-      +o nick #channel     — give ops to a user
-      +k secretkey         — set channel key (password)
-      +i                   — set yourself invisible
-
     Args:
         params (SetModeInput):
             - session_id (str): Your session_id.
@@ -2720,7 +2768,6 @@ async def irc_set_mode(params: SetModeInput) -> str:
 async def irc_invite(params: InviteInput) -> str:
     """
     Invite a nick to a channel. Required for invite-only (+i) channels.
-    You typically need operator status to invite to +i channels.
 
     Args:
         params (InviteInput):
@@ -2745,8 +2792,7 @@ async def irc_invite(params: InviteInput) -> str:
 @mcp.tool(name="irc_knock", annotations={"title":"Knock on an invite-only channel","readOnlyHint":False,"destructiveHint":False,"idempotentHint":False,"openWorldHint":True})
 async def irc_knock(params: KnockInput) -> str:
     """
-    Send a KNOCK request to an invite-only (+i) channel. Notifies channel
-    operators that you want to join. They can then invite you.
+    Send a KNOCK request to an invite-only (+i) channel.
 
     Args:
         params (KnockInput):
@@ -2772,12 +2818,11 @@ async def irc_knock(params: KnockInput) -> str:
 async def irc_who(params: WhoInput) -> str:
     """
     Send a WHO query for richer user information than NAMES provides.
-    Returns username, hostname, server, realname, and idle time.
 
     Args:
         params (WhoInput):
             - session_id (str): Your session_id.
-            - target (str): Channel, nick, or hostmask (e.g. '#ClaudeBot', 'r0d3nt', '*.2600.chat').
+            - target (str): Channel, nick, or hostmask.
             - operators_only (bool): If true, only return IRC operators.
 
     Returns:
@@ -2798,7 +2843,6 @@ async def irc_who(params: WhoInput) -> str:
 async def irc_ison(params: IsonInput) -> str:
     """
     Check which nicks from a list are currently connected to the IRC network.
-    Faster than doing multiple WHOIS calls.
 
     Args:
         params (IsonInput):
@@ -2824,7 +2868,6 @@ async def irc_ison(params: IsonInput) -> str:
 async def irc_userhost(params: UserhostInput) -> str:
     """
     Get userhost information for up to 5 nicks simultaneously.
-    Returns nick!user@host and away status.
 
     Args:
         params (UserhostInput):
@@ -2848,11 +2891,7 @@ async def irc_userhost(params: UserhostInput) -> str:
 @mcp.tool(name="irc_monitor", annotations={"title":"Monitor nicks for online/offline status","readOnlyHint":False,"destructiveHint":False,"idempotentHint":True,"openWorldHint":True})
 async def irc_monitor(params: MonitorInput) -> str:
     """
-    Add nicks to your MONITOR list. The server will notify you when they
-    come online or go offline. Use irc_monitor_status to check current state.
-
-    MONITOR is ircd-hybrid's efficient nick tracking system — more reliable
-    than polling with ISON.
+    Add nicks to your MONITOR list.
 
     Args:
         params (MonitorInput):
@@ -2900,9 +2939,7 @@ async def irc_monitor_status(params: SessionInput) -> str:
 @mcp.tool(name="irc_send_notice", annotations={"title":"Send a NOTICE to a nick or channel","readOnlyHint":False,"destructiveHint":False,"idempotentHint":False,"openWorldHint":True})
 async def irc_send_notice(params: SendNoticeInput) -> str:
     """
-    Send a NOTICE instead of a PRIVMSG. NOTICEs are conventionally used for
-    automated or informational messages. Most IRC clients display them
-    differently from regular messages and bots should not auto-reply to them.
+    Send a NOTICE instead of a PRIVMSG.
 
     Args:
         params (SendNoticeInput):
@@ -2927,8 +2964,7 @@ async def irc_send_notice(params: SendNoticeInput) -> str:
 @mcp.tool(name="irc_read_private_messages", annotations={"title":"Read buffered private messages (PMs)","readOnlyHint":True,"destructiveHint":False,"idempotentHint":True,"openWorldHint":False})
 async def irc_read_private_messages(params: ReadPMsInput) -> str:
     """
-    Read private messages (PMs) received this session. Messages are buffered
-    as they arrive — up to 100 per sender nick.
+    Read private messages (PMs) received this session.
 
     Args:
         params (ReadPMsInput):
@@ -2955,13 +2991,11 @@ async def irc_read_private_messages(params: ReadPMsInput) -> str:
 async def irc_silence(params: SilenceInput) -> str:
     """
     Add a nick or hostmask to your server-side SILENCE list.
-    The IRC server will block messages from silenced users before they reach you —
-    more effective than client-side ignore.
 
     Args:
         params (SilenceInput):
             - session_id (str): Your session_id.
-            - mask (str): Nick or hostmask to silence (e.g. 'annoyingnick' or '*!*@*.badhost.com').
+            - mask (str): Nick or hostmask to silence.
 
     Returns:
         str: Confirmation.
@@ -3004,8 +3038,7 @@ async def irc_unsilence(params: SilenceInput) -> str:
 @mcp.tool(name="irc_setname", annotations={"title":"Change your IRC realname/gecos field","readOnlyHint":False,"destructiveHint":False,"idempotentHint":True,"openWorldHint":True})
 async def irc_setname(params: SetnameInput) -> str:
     """
-    Change your realname (gecos) field — the text shown after your
-    host in /whois output. Not all servers support SETNAME.
+    Change your realname (gecos) field shown in /whois output.
 
     Args:
         params (SetnameInput):
